@@ -1562,6 +1562,7 @@ impl ValidatedCompletion {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // Local activity resolutions are by far the most common
 pub(crate) enum LocalResolution {
     LocalActivity(LocalActivityResolution),
     Optimistic(optimistic::OptimisticResult),
