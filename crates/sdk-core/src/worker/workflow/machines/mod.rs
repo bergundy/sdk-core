@@ -24,7 +24,9 @@ mod workflow_task_state_machine;
 mod transition_coverage;
 
 pub(crate) use temporalio_common::fsm_trait::MachineError;
-pub(crate) use workflow_machines::{MachinesWFTResponseContent, WorkflowMachines};
+pub(crate) use workflow_machines::{
+    CheckpointReason, MachinesWFTResponseContent, WorkflowMachines,
+};
 
 use crate::{
     telemetry::VecDisplayer,
@@ -194,6 +196,16 @@ impl Machines {
             Machines::SignalExternalMachine(m) => m.was_cancelled_before_sent_to_server(),
             Machines::TimerMachine(m) => m.was_cancelled_before_sent_to_server(),
             Machines::NexusOperationMachine(m) => m.was_cancelled_before_sent_to_server(),
+            _ => false,
+        }
+    }
+
+    /// True if the workflow already observed this machine's outcome during the workflow task that
+    /// started it optimistically.
+    fn resolved_optimistically(&self) -> bool {
+        match self {
+            Machines::ActivityMachine(m) => m.resolved_optimistically(),
+            Machines::TimerMachine(m) => m.resolved_optimistically(),
             _ => false,
         }
     }

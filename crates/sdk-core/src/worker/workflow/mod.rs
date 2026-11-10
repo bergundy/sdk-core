@@ -6,6 +6,7 @@ mod driven_workflow;
 mod history_update;
 mod machines;
 mod managed_run;
+pub(crate) mod optimistic;
 mod run_cache;
 mod wft_extraction;
 pub(crate) mod wft_poller;
@@ -162,6 +163,7 @@ pub(crate) struct WorkflowBasics {
 
 pub(crate) struct RunBasics<'a> {
     pub(crate) worker_config: Arc<WorkerConfig>,
+    pub(crate) optimistic_env: Option<Arc<dyn optimistic::OptimisticEnv>>,
     pub(crate) workflow_id: String,
     pub(crate) workflow_type: String,
     pub(crate) run_id: String,
@@ -1497,6 +1499,7 @@ impl ValidatedCompletion {
 #[derive(Debug)]
 pub(crate) enum LocalResolution {
     LocalActivity(LocalActivityResolution),
+    Optimistic(optimistic::OptimisticResult),
 }
 impl LocalResolution {
     fn is_la_cancel_confirmation(&self) -> bool {
@@ -1504,6 +1507,7 @@ impl LocalResolution {
             LocalResolution::LocalActivity(lar) => {
                 matches!(lar.result, LocalActivityExecutionResult::Cancelled(_))
             }
+            LocalResolution::Optimistic(_) => false,
         }
     }
 }

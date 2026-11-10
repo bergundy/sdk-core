@@ -1,4 +1,7 @@
 mod local_acts;
+mod optimistic;
+
+pub(crate) use optimistic::CheckpointReason;
 
 use super::{
     Machines, NewMachineWithCommand, TemporalStateMachine,
@@ -6,10 +9,13 @@ use super::{
     cancel_workflow_state_machine::cancel_workflow,
     complete_workflow_state_machine::complete_workflow,
     continue_as_new_workflow_state_machine::continue_as_new,
-    fail_workflow_state_machine::fail_workflow, local_activity_state_machine::new_local_activity,
-    patch_state_machine::has_change, signal_external_state_machine::new_external_signal,
-    timer_state_machine::new_timer, upsert_search_attributes_state_machine::upsert_search_attrs,
-    workflow_machines::local_acts::LocalActivityData,
+    fail_workflow_state_machine::fail_workflow,
+    local_activity_state_machine::new_local_activity,
+    patch_state_machine::has_change,
+    signal_external_state_machine::new_external_signal,
+    timer_state_machine::new_timer,
+    upsert_search_attributes_state_machine::upsert_search_attrs,
+    workflow_machines::{local_acts::LocalActivityData, optimistic::OptimisticData},
     workflow_task_state_machine::WorkflowTaskMachine,
 };
 use crate::{
@@ -168,6 +174,9 @@ pub(crate) struct WorkflowMachines {
     /// Contains extra local-activity related data
     local_activity_data: LocalActivityData,
 
+    /// Speculation window (optimistic start) state
+    optimistic: OptimisticData,
+
     /// The workflow that is being driven by this instance of the machines
     drive_me: DrivenWorkflow,
 
@@ -309,6 +318,7 @@ impl WorkflowMachines {
             message_outbox: Default::default(),
             encountered_patch_markers: Default::default(),
             local_activity_data: LocalActivityData::default(),
+            optimistic: OptimisticData::new(basics.optimistic_env),
             have_seen_terminal_event: false,
             worker_config: basics.worker_config,
         }
@@ -360,6 +370,9 @@ impl WorkflowMachines {
     pub(crate) fn local_resolution(&mut self, resolution: LocalResolution) -> Result<bool> {
         let mut result_important = true;
         match resolution {
+            LocalResolution::Optimistic(result) => {
+                result_important = self.optimistic_local_result(result)?;
+            }
             LocalResolution::LocalActivity(LocalActivityResolution {
                 seq,
                 result,
@@ -440,10 +453,14 @@ impl WorkflowMachines {
         (*self.observed_internal_flags)
             .borrow_mut()
             .write_all_known();
-        self.commands
-            .iter()
-            .filter(|c| !self.machine(c.machine).is_final_state())
-            .map(|c| c.command.clone())
+        self.interleave_optimistic_resolutions(
+            self.commands
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| !self.machine(c.machine).is_final_state())
+                .map(|(ix, c)| (ix, c.command.clone())),
+        )
+        .into_iter()
     }
 
     /// Returns the next activation that needs to be performed by the lang sdk. Things like unblock
@@ -589,7 +606,8 @@ impl WorkflowMachines {
         self.handle_driven_results(results)?;
         self.apply_local_activity_peeked_resolutions(false)?;
         self.release_held_local_activity_resolutions_if_idle()?;
-        self.prepare_commands()?;
+        let first_new = self.prepare_commands()?;
+        self.optimistic_after_activation(first_new)?;
         if self.workflow_is_finished()
             && let Some(rt) = self.total_runtime()
         {
@@ -734,6 +752,8 @@ impl WorkflowMachines {
                 && eid > self.last_history_from_server.previous_wft_started_id
                 && event.event_type() != EventType::WorkflowTaskCompleted
                 && !event.is_command_event()
+                // Optimistic resolutions are produced by the SDK too
+                && !event.is_optimistic_resolution()
             {
                 // Replay is finished
                 self.replaying = false;
@@ -973,7 +993,7 @@ impl WorkflowMachines {
         }
 
         if let Some(initial_cmd_id) = event.get_initial_command_event_id() {
-            let mkey = self
+            let mkey = *self
                 .machines_by_event_id
                 .get(&initial_cmd_id)
                 .ok_or_else(|| {
@@ -982,7 +1002,11 @@ impl WorkflowMachines {
                          could not find a matching command for it: {event:?}"
                     )
                 })?;
-            self.submachine_handle_event(*mkey, event_dat)?;
+            if event.is_optimistic_resolution() {
+                self.apply_optimistic_resolution_event(mkey, event_dat)?;
+            } else {
+                self.submachine_handle_event(mkey, event_dat)?;
+            }
         } else {
             self.handle_non_stateful_event(event_dat)?;
         };
@@ -1188,7 +1212,8 @@ impl WorkflowMachines {
     /// Transfer commands from `current_wf_task_commands` to `commands`, so they may be sent off
     /// to the server. While doing so, [TemporalStateMachine::handle_command] is called on the
     /// machine associated with the command.
-    fn prepare_commands(&mut self) -> Result<()> {
+    /// Returns the index in `commands` of the first command this call added.
+    fn prepare_commands(&mut self) -> Result<usize> {
         // It's possible we might prepare commands more than once before completing a WFT. (Because
         // of local activities, of course). Some commands might have since been cancelled that we
         // already prepared. Rip them out of the outgoing command list if so.
@@ -1200,6 +1225,7 @@ impl WorkflowMachines {
                 .was_cancelled_before_sent_to_server()
         });
 
+        let first_new = self.commands.len();
         while let Some(c) = self.current_wf_task_commands.pop_front() {
             if !self
                 .machine(c.machine)
@@ -1213,7 +1239,7 @@ impl WorkflowMachines {
             }
         }
         debug!(commands = %self.commands.display(), "prepared commands");
-        Ok(())
+        Ok(first_new)
     }
 
     /// After a machine handles either an event or a command, it produces [MachineResponses] which
@@ -1364,6 +1390,7 @@ impl WorkflowMachines {
     /// Called when a workflow task started event has triggered. Ensures we are tracking the ID
     /// of the current started event as well as workflow time properly.
     fn task_started(&mut self, task_started_event_id: i64, time: SystemTime) {
+        self.optimistic_wft_started();
         self.current_started_event_id = task_started_event_id;
         self.wft_start_time = Some(time);
         self.set_current_time(time);
@@ -1411,6 +1438,8 @@ impl WorkflowMachines {
                         cancel,
                         annotations
                     );
+                    let mk = self.get_machine_key(CommandID::Timer(attrs.seq))?;
+                    self.optimistic_command_cancelled(mk);
                 }
                 WFCommandVariant::AddActivity(attrs) => {
                     let seq = attrs.seq;
@@ -1458,6 +1487,8 @@ impl WorkflowMachines {
                         cancel,
                         annotations
                     );
+                    let mk = self.get_machine_key(CommandID::Activity(attrs.seq))?;
+                    self.optimistic_command_cancelled(mk);
                 }
                 WFCommandVariant::RequestCancelLocalActivity(attrs) => {
                     let activation_index = self.local_activity_data.current_activation_index();
