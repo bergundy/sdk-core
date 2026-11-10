@@ -649,6 +649,7 @@ impl TimerOptions {
                         .try_into()
                         .expect("workflow timer timeout must fit into protobuf duration"),
                 ),
+                ..Default::default()
             }),
             self.summary,
             None,

@@ -62,6 +62,11 @@ message StartTimer {
     // Lang's incremental sequence number, used as the operation identifier
     uint32 seq = 1;
     google.protobuf.Duration start_to_fire_timeout = 2;
+    // Set when the timer was started inside a speculative block. Core may then run the timer
+    // locally inside a speculation window (optimistic start) instead of sending it to the server
+    // right away. Whether it actually does is up to Core: workflow code must behave the same
+    // either way, and replay is unaffected by the decision.
+    bool speculative = 3;
 }
 
 message CancelTimer {
@@ -106,6 +111,14 @@ message ScheduleActivity {
     coresdk.common.VersioningIntent versioning_intent = 15;
     // The Priority to use for this activity
     temporal.api.common.v1.Priority priority = 16;
+    // Set when the activity was scheduled inside a speculative block. Core may then start the
+    // activity on this worker inside a speculation window (optimistic start), before the server
+    // knows about it, and deliver it through the normal activity task stream. Whether it actually
+    // does is up to Core (task queue, free slots, server capability, ...): workflow code must
+    // behave the same either way, and replay is unaffected by the decision. Lang must not set
+    // this on local activities; scheduling a local activity inside a speculative block is an
+    // error lang reports itself.
+    bool speculative = 17;
 }
 
 message ScheduleLocalActivity {

@@ -1068,6 +1068,7 @@ impl WorkerTestHelpers for Worker {
                 StartTimer {
                     seq,
                     start_to_fire_timeout: Some(duration.try_into().expect("duration fits")),
+                    ..Default::default()
                 }
                 .into(),
             ],

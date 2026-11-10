@@ -68,6 +68,21 @@ message ScheduleActivityTaskCommandAttributes {
     // Priority metadata. If this message is not present, or any fields are not
     // present, they inherit the values from the workflow.
     temporal.api.common.v1.Priority priority = 14;
+    // Set when the worker already started executing this activity inside a speculation window.
+    // The activity is recorded as started by this worker, like an eager activity. Only valid for
+    // activities on the workflow's task queue, when the namespace has the `optimistic_start`
+    // capability.
+    OptimisticStart optimistic_start = 15;
+}
+
+// Marks a command the worker already started executing inside a speculation window, before the
+// server knew about it.
+message OptimisticStart {
+    // Time between the worker receiving the current workflow task and starting this command,
+    // measured on the worker's monotonic clock.
+    google.protobuf.Duration start_offset = 1;
+    // ScheduleActivityTask only: details from the latest local heartbeat, if any.
+    temporal.api.common.v1.Payloads heartbeat_details = 2;
 }
 
 message RequestCancelActivityTaskCommandAttributes {
@@ -84,6 +99,40 @@ message StartTimerCommandAttributes {
     // (-- api-linter: core::0140::prepositions=disabled
     //     aip.dev/not-precedent: "to" is used to indicate interval. --)
     google.protobuf.Duration start_to_fire_timeout = 2;
+    // Set when the worker already started this timer inside a speculation window. The timer
+    // expires at the backdated start time plus `start_to_fire_timeout`.
+    OptimisticStart optimistic_start = 3;
+}
+
+// Records an outcome the workflow observed for an activity started optimistically earlier in the
+// same command list. Produces `ACTIVITY_TASK_STARTED` followed by the outcome event.
+message ResolveOptimisticActivityCommandAttributes {
+    message Completed {
+        temporal.api.common.v1.Payloads result = 1;
+    }
+    // Only valid after a `RequestCancelActivityTask` command for the same activity.
+    message Canceled {
+        temporal.api.common.v1.Payloads details = 1;
+    }
+
+    // The `ACTIVITY_TASK_SCHEDULED` event id of the activity, predicted by the worker.
+    int64 scheduled_event_id = 1;
+    oneof outcome {
+        Completed completed = 2;
+        Canceled canceled = 3;
+    }
+    // Time between the worker receiving the current workflow task and the workflow observing
+    // this outcome, measured on the worker's monotonic clock.
+    google.protobuf.Duration resolve_offset = 4;
+}
+
+// Records that a timer started optimistically earlier in the same command list fired, and that
+// the workflow observed it. Produces `TIMER_FIRED`.
+message FireOptimisticTimerCommandAttributes {
+    string timer_id = 1;
+    // Time between the worker receiving the current workflow task and the workflow observing the
+    // timer firing, measured on the worker's monotonic clock.
+    google.protobuf.Duration fire_offset = 2;
 }
 
 message CompleteWorkflowExecutionCommandAttributes {
@@ -324,5 +373,7 @@ message Command {
 
         ScheduleNexusOperationCommandAttributes schedule_nexus_operation_command_attributes = 18;
         RequestCancelNexusOperationCommandAttributes request_cancel_nexus_operation_command_attributes = 19;
+        ResolveOptimisticActivityCommandAttributes resolve_optimistic_activity_command_attributes = 20;
+        FireOptimisticTimerCommandAttributes fire_optimistic_timer_command_attributes = 21;
     }
 }

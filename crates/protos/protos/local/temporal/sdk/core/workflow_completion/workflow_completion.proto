@@ -33,6 +33,14 @@ message Success {
     repeated uint32 used_internal_flags = 6;
     // The versioning behavior this workflow is currently using
     temporal.api.enums.v1.VersioningBehavior versioning_behavior = 7;
+    // True if a speculative block exited during this activation. Core then ends the current
+    // speculation window at the end of the activation unless `speculative_block_active` is set and
+    // no non-speculative work (normal activities, timers, child workflows, Nexus operations) is
+    // pending. A loop of sequential blocks that exits one block and enters the next in the same
+    // activation therefore keeps a single window going.
+    bool speculative_block_exited = 8;
+    // True if at least one speculative block is still active at the end of this activation.
+    bool speculative_block_active = 9;
 }
 
 // Failure to activate or execute a workflow
