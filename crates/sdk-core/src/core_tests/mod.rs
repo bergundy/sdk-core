@@ -1,5 +1,6 @@
 mod activity_tasks;
 mod event_groups;
+mod optimistic_start;
 mod queries;
 mod query_eviction;
 mod replay_flag;
