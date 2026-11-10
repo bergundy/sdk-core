@@ -33,6 +33,16 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* Experimental optimistic start: activities and timers that lang marks `speculative` (because
+  workflow code started them inside a speculative block) may start on this worker right away,
+  before the server knows about them, when the namespace has the `optimistic_start`
+  capability. Their outcomes reach the workflow within the same workflow task, and history gets
+  ordinary activity and timer events. Lang reports block exits with `speculative_block_exited`
+  and `speculative_block_active` on activation completions. The new
+  `optimistic_start_payload_budget` worker option (default 2 MiB) bounds the payloads held
+  before Core checkpoints.
+
 ## [0.11.0] - 2026-11-09
 
 ### Added
