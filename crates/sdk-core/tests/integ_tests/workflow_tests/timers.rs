@@ -64,6 +64,7 @@ async fn timer_workflow_manual() {
             StartTimer {
                 seq: 0,
                 start_to_fire_timeout: Some(prost_dur!(from_secs(1))),
+                ..Default::default()
             }
             .into(),
         ],
@@ -87,11 +88,13 @@ async fn timer_cancel_workflow() {
             StartTimer {
                 seq: 0,
                 start_to_fire_timeout: Some(prost_dur!(from_millis(50))),
+                ..Default::default()
             }
             .into(),
             StartTimer {
                 seq: 1,
                 start_to_fire_timeout: Some(prost_dur!(from_secs(10))),
+                ..Default::default()
             }
             .into(),
         ],
