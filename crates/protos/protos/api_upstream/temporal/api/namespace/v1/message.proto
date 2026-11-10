@@ -66,6 +66,10 @@ message NamespaceInfo {
         bool standalone_activity_batch_operations = 16;
         // True if the namespace supports standalone activity operator commands.
         bool standalone_activity_operator_commands = 17;
+        // True if the namespace supports optimistically started activities and timers
+        // (`ScheduleActivityTaskCommandAttributes.optimistic_start`,
+        // `StartTimerCommandAttributes.optimistic_start` and the commands that resolve them).
+        bool optimistic_start = 18;
     }
 
     // Namespace configured limits

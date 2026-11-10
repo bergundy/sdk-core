@@ -759,7 +759,10 @@ const BLOB_FIELDS: &[&str] = &[
     "temporal.api.command.v1.ContinueAsNewWorkflowExecutionCommandAttributes.input",
     "temporal.api.command.v1.FailWorkflowExecutionCommandAttributes.failure", // whole Failure proto
     "temporal.api.command.v1.ModifyWorkflowPropertiesCommandAttributes.upserted_memo", // memo fields data-sum
+    "temporal.api.command.v1.OptimisticStart.heartbeat_details",
     "temporal.api.command.v1.RecordMarkerCommandAttributes.details", // map<string,Payloads> sum
+    "temporal.api.command.v1.ResolveOptimisticActivityCommandAttributes.Canceled.details",
+    "temporal.api.command.v1.ResolveOptimisticActivityCommandAttributes.Completed.result",
     "temporal.api.command.v1.ScheduleActivityTaskCommandAttributes.input",
     "temporal.api.command.v1.ScheduleNexusOperationCommandAttributes.input",
     "temporal.api.command.v1.SignalExternalWorkflowExecutionCommandAttributes.input",

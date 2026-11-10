@@ -1449,6 +1449,7 @@ async fn no_eager_activities_requested_when_worker_options_disable_it(
                 workflow_task: None,
                 activity_tasks: vec![],
                 reset_history_event_id: 0,
+                ..Default::default()
             })
         });
     let mut mock = single_hist_mock_sg(wfid, t, [1], mock, true);
@@ -1542,6 +1543,7 @@ async fn activity_tasks_from_completion_are_delivered() {
                     })
                     .collect_vec(),
                 reset_history_event_id: 0,
+                ..Default::default()
             })
         });
     mock.expect_complete_activity_task()

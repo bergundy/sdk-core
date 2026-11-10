@@ -279,6 +279,7 @@ impl TestHistoryBuilder {
         self.add(TimerFiredEventAttributes {
             started_event_id: timer_started_evt_id,
             timer_id,
+            ..Default::default()
         });
     }
 

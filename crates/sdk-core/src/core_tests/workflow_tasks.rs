@@ -1219,6 +1219,7 @@ async fn buffered_work_drained_on_shutdown() {
         TimerFiredEventAttributes {
             started_event_id: timer_started_event_id,
             timer_id: "1".to_string(),
+            ..Default::default()
         },
     ));
     t.add_full_wf_task();
@@ -2590,6 +2591,7 @@ async fn tasks_from_completion_are_delivered() {
         workflow_task: Some(hist_to_poll_resp(&t, wfid.to_owned(), 2.into()).resp),
         activity_tasks: vec![],
         reset_history_event_id: 0,
+        ..Default::default()
     };
     mock.expect_complete_workflow_task()
         .times(1)

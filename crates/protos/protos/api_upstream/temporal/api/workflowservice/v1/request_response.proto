@@ -488,6 +488,11 @@ message RespondWorkflowTaskCompletedResponse {
     // Will be the event ID of the last workflow task started event in the history before the new workflow task.
     // Server is only expected to discard a workflow task if it could not have modified the workflow state.
     int64 reset_history_event_id = 3;
+    // Activities started optimistically in this task that are still running and are now owned by
+    // the server, like eager activities. The worker keeps executing them and uses these task
+    // tokens for heartbeats and completion. Kept separate from `activity_tasks` so they can't be
+    // mistaken for new tasks to start.
+    repeated PollActivityTaskQueueResponse optimistic_activity_tasks = 4;
 }
 
 message RespondWorkflowTaskFailedRequest {
