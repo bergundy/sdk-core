@@ -149,6 +149,21 @@ impl OptimisticHistoryExt for TestHistoryBuilder {
     }
 }
 
+/// Adds a full workflow task, returning its started event's time, which optimistic workflow times
+/// are relative to.
+fn add_full_wf_task_returning_start(t: &mut TestHistoryBuilder) -> SystemTime {
+    t.add_workflow_task_scheduled_and_started();
+    let started = t
+        .last_event()
+        .unwrap()
+        .event_time
+        .unwrap()
+        .try_into()
+        .unwrap();
+    t.add_workflow_task_completed();
+    started
+}
+
 fn job_names(activation: &WorkflowActivation) -> Vec<String> {
     activation
         .jobs
@@ -223,8 +238,7 @@ fn example_workflow(jobs: &[String]) -> Vec<WFCommand> {
 fn example_history(signal_after_batch: bool, finish: bool) -> (TestHistoryBuilder, SystemTime) {
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
-    t.add_full_wf_task();
-    let wft_started: SystemTime = t.wft_start_time().try_into().unwrap();
+    let wft_started = add_full_wf_task_returning_start(&mut t);
     let a1 = t.add_optimistic_scheduled(1);
     let a2 = t.add_optimistic_scheduled(2);
     assert_eq!((a1, a2), (5, 6));
@@ -392,8 +406,7 @@ fn replays_history_without_speculation() {
 fn replays_cancel_of_optimistic_activity() {
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
-    t.add_full_wf_task();
-    let wft_started: SystemTime = t.wft_start_time().try_into().unwrap();
+    let wft_started = add_full_wf_task_returning_start(&mut t);
     let a1 = t.add_optimistic_scheduled(1);
     let timer_started = t.add_optimistic_timer_started(2);
     t.add_optimistic_timer_fired(timer_started, 2, wft_started + Duration::from_secs(3));
@@ -420,8 +433,7 @@ fn replays_cancel_of_optimistic_activity() {
 fn replays_observed_cancellation() {
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
-    t.add_full_wf_task();
-    let wft_started: SystemTime = t.wft_start_time().try_into().unwrap();
+    let wft_started = add_full_wf_task_returning_start(&mut t);
     let a1 = t.add_optimistic_scheduled(1);
     let timer_started = t.add_optimistic_timer_started(2);
     t.add_optimistic_timer_fired(timer_started, 2, wft_started + Duration::from_secs(3));
