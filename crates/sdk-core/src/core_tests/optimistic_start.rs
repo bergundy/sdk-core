@@ -400,6 +400,71 @@ async fn window_records_ordered_log_and_hands_off() {
     drain_pollers_and_shutdown(&core).await;
 }
 
+/// Tasks for optimistic activities carry the timeouts the server fills in when it schedules an
+/// activity, as on tasks it dispatches, since lang may rely on them.
+#[tokio::test]
+async fn optimistic_activity_tasks_have_server_timeouts() {
+    let mut client = mock_worker_client();
+    client
+        .expect_complete_activity_task()
+        .times(2)
+        .returning(|_, _| Ok(RespondActivityTaskCompletedResponse::default()));
+    let (core, _completions) = optimistic_worker(
+        history(Duration::from_secs(10)),
+        client,
+        Box::new(|_| RespondWorkflowTaskCompletedResponse {
+            optimistic_activity_tasks: vec![
+                handed_off("act-1", b"real-1"),
+                handed_off("act-2", b"real-2"),
+            ],
+            ..Default::default()
+        }),
+    )
+    .await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    let run_id = act.run_id.clone();
+    let mut schedule_to_close_only = speculative_activity(&core, 2);
+    if let workflow_command::Variant::ScheduleActivity(a) = &mut schedule_to_close_only {
+        a.start_to_close_timeout = None;
+        a.schedule_to_close_timeout = Some(Duration::from_secs(5).try_into().unwrap());
+        a.heartbeat_timeout = Some(Duration::from_secs(30).try_into().unwrap());
+    }
+    // The block exits with both activities still running, so they're handed off
+    core.complete_workflow_activation(completion(
+        &run_id,
+        vec![speculative_activity(&core, 1), schedule_to_close_only],
+        true,
+        false,
+    ))
+    .await
+    .unwrap();
+
+    let secs = |seconds| Some(prost_types::Duration { seconds, nanos: 0 });
+    // The workflow has no run timeout, so there's no schedule-to-close timeout unless set
+    for (seq, schedule_to_close, start_to_close, heartbeat) in [(1, 0, 10, 0), (2, 5, 5, 5)] {
+        let task = core.poll_activity_task().await.unwrap();
+        let Some(activity_task::Variant::Start(start)) = task.variant else {
+            panic!("expected an activity start, got {task:?}");
+        };
+        assert_eq!(start.activity_id, format!("act-{seq}"));
+        assert_eq!(
+            (
+                start.schedule_to_close_timeout,
+                start.start_to_close_timeout,
+                start.heartbeat_timeout
+            ),
+            (
+                secs(schedule_to_close),
+                secs(start_to_close),
+                secs(heartbeat)
+            )
+        );
+        complete_activity(&core, &task.task_token.into(), seq).await;
+    }
+
+    drain_pollers_and_shutdown(&core).await;
+}
+
 /// A local activity scheduled while the window is open checkpoints the window.
 #[tokio::test]
 async fn non_deferrable_command_checkpoints() {

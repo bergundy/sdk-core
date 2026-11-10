@@ -1775,6 +1775,7 @@ enum CommandID {
 #[derive(Debug, Clone)]
 struct WorkflowStartedInfo {
     workflow_task_timeout: Option<Duration>,
+    workflow_run_timeout: Option<Duration>,
     memo: Option<Memo>,
     search_attrs: Option<SearchAttributes>,
     retry_policy: Option<RetryPolicy>,
