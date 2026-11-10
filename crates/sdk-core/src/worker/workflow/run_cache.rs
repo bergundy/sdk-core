@@ -4,6 +4,7 @@ use crate::{
     worker::workflow::{
         HistoryUpdate, LocalActivityRequestSink, PermittedWFT, RequestEvictMsg, RunBasics,
         managed_run::{ManagedRun, RunUpdateAct},
+        optimistic::OptimisticEnv,
     },
 };
 use lru::LruCache;
@@ -20,6 +21,7 @@ pub(super) struct RunCache {
     /// Run id -> Data
     runs: LruCache<String, ManagedRun>,
     local_activity_request_sink: Option<Rc<dyn LocalActivityRequestSink>>,
+    optimistic_env: Option<Arc<dyn OptimisticEnv>>,
 
     metrics: MetricsContext,
 }
@@ -30,6 +32,7 @@ impl RunCache {
         sdk_name_and_version: (String, String),
         server_capabilities: get_system_info_response::Capabilities,
         local_activity_request_sink: Option<impl LocalActivityRequestSink>,
+        optimistic_env: Option<Arc<dyn OptimisticEnv>>,
         metrics: MetricsContext,
     ) -> Self {
         // The cache needs room for at least one run, otherwise we couldn't do anything. In
@@ -48,6 +51,7 @@ impl RunCache {
             ),
             local_activity_request_sink: local_activity_request_sink
                 .map(|s| Rc::new(s) as Rc<dyn LocalActivityRequestSink>),
+            optimistic_env,
             metrics,
         }
     }
@@ -70,7 +74,7 @@ impl RunCache {
         let (mrh, rur) = ManagedRun::new(
             RunBasics {
                 worker_config: self.worker_config.clone(),
-                optimistic_env: None,
+                optimistic_env: self.optimistic_env.clone(),
                 workflow_id: pwft.work.execution.workflow_id.clone(),
                 workflow_type: pwft.work.workflow_type.clone(),
                 run_id: run_id.clone(),

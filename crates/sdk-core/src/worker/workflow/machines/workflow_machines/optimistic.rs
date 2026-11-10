@@ -116,6 +116,7 @@ pub(crate) enum CheckpointReason {
     PayloadBudget,
     UnobservedOutcome,
     QueryResponse,
+    Eviction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
