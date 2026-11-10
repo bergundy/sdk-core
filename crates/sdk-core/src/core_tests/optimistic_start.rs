@@ -1,9 +1,12 @@
 //! Speculation windows (optimistic start) driven through a worker with mocked server calls.
 
 use crate::{
-    ActivityHeartbeat, PollError, Worker,
+    ActivityHeartbeat, PollError, Worker, WorkerConfig,
     replay::TestHistoryBuilder,
-    test_help::{MockPollCfg, build_mock_pollers, drain_pollers_and_shutdown, mock_worker},
+    test_help::{
+        MockPollCfg, build_mock_pollers, drain_pollers_and_shutdown, mock_worker,
+        schedule_local_activity_cmd,
+    },
     worker::client::{MockWorkerClient, WorkflowTaskCompletion, mocks::mock_worker_client},
 };
 use futures_util::FutureExt;
@@ -19,8 +22,8 @@ use temporalio_common::protos::{
         activity_task::{ActivityTask, activity_task},
         workflow_activation::{WorkflowActivation, workflow_activation_job},
         workflow_commands::{
-            ActivityCancellationType, CompleteWorkflowExecution, ScheduleActivity, StartTimer,
-            workflow_command,
+            ActivityCancellationType, CompleteWorkflowExecution, RequestCancelActivity,
+            ScheduleActivity, StartTimer, workflow_command,
         },
         workflow_completion::{self, WorkflowActivationCompletion, workflow_activation_completion},
     },
@@ -33,8 +36,9 @@ use temporalio_common::protos::{
         namespace::v1::{NamespaceInfo, namespace_info::Capabilities},
         workflowservice::v1::{
             DescribeNamespaceResponse, PollActivityTaskQueueResponse,
-            RecordActivityTaskHeartbeatResponse, RespondActivityTaskCompletedResponse,
-            RespondActivityTaskFailedResponse, RespondWorkflowTaskCompletedResponse,
+            RecordActivityTaskHeartbeatResponse, RespondActivityTaskCanceledResponse,
+            RespondActivityTaskCompletedResponse, RespondActivityTaskFailedResponse,
+            RespondWorkflowTaskCompletedResponse,
         },
     },
 };
@@ -45,13 +49,28 @@ use tokio::{
 
 type CompletionResponder =
     Box<dyn FnMut(&WorkflowTaskCompletion) -> RespondWorkflowTaskCompletedResponse + Send>;
+type FallibleCompletionResponder = Box<
+    dyn FnMut(
+            &WorkflowTaskCompletion,
+        ) -> Result<RespondWorkflowTaskCompletedResponse, tonic::Status>
+        + Send,
+>;
 
 /// A worker for a single workflow whose first workflow task is handed out, with the namespace
 /// supporting optimistic start. WFT completions are sent to the returned channel.
 async fn optimistic_worker(
     t: TestHistoryBuilder,
-    mut client: MockWorkerClient,
+    client: MockWorkerClient,
     mut respond: CompletionResponder,
+) -> (Arc<Worker>, UnboundedReceiver<WorkflowTaskCompletion>) {
+    optimistic_worker_with(t, client, Box::new(move |wtc| Ok(respond(wtc))), |_| {}).await
+}
+
+async fn optimistic_worker_with(
+    t: TestHistoryBuilder,
+    mut client: MockWorkerClient,
+    mut respond: FallibleCompletionResponder,
+    cfg: impl FnOnce(&mut WorkerConfig),
 ) -> (Arc<Worker>, UnboundedReceiver<WorkflowTaskCompletion>) {
     client.expect_describe_namespace().returning(|| {
         Ok(DescribeNamespaceResponse {
@@ -71,11 +90,12 @@ async fn optimistic_worker(
     mh.completion_mock_fn = Some(Box::new(move |wtc| {
         let resp = respond(wtc);
         let _ = tx.send(wtc.clone());
-        Ok(resp)
+        resp
     }));
     let mut mock = build_mock_pollers(mh);
     mock.worker_cfg(|wc| {
         wc.max_cached_workflows = 2;
+        cfg(wc);
     });
     let core = mock_worker(mock);
     core.validate().await.unwrap();
@@ -733,5 +753,329 @@ async fn next_task_applies_batch_without_jobs() {
     core.complete_workflow_activation(completion(&run_id, vec![complete_workflow()], false, false))
         .await
         .unwrap();
+    drain_pollers_and_shutdown(&core).await;
+}
+
+fn cancel_activity(seq: u32) -> workflow_command::Variant {
+    RequestCancelActivity { seq }.into()
+}
+
+/// A TryCancel cancellation of an optimistic activity references its predicted scheduled event
+/// id and resolves the workflow immediately. The activity's own cancellation isn't observed, so it
+/// is reported to the server after the handoff.
+#[tokio::test]
+async fn try_cancel_is_logged_and_reported_after_handoff() {
+    let mut client = mock_worker_client();
+    client
+        .expect_cancel_activity_task()
+        .withf(|token, _| *token == TaskToken::from(b"real-1".to_vec()))
+        .times(1)
+        .returning(|_, _| Ok(RespondActivityTaskCanceledResponse::default()));
+    let (core, mut completions) = optimistic_worker(
+        history(Duration::from_secs(10)),
+        client,
+        Box::new(|_| RespondWorkflowTaskCompletedResponse {
+            optimistic_activity_tasks: vec![handed_off("act-1", b"real-1")],
+            ..Default::default()
+        }),
+    )
+    .await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    let run_id = act.run_id.clone();
+    core.complete_workflow_activation(completion(
+        &run_id,
+        vec![
+            speculative_activity(&core, 1),
+            speculative_timer(2, Duration::from_millis(10)),
+        ],
+        false,
+        true,
+    ))
+    .await
+    .unwrap();
+    let (token, _) = poll_start(&core).await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(resolved_seq(&act), ["timer-2"]);
+    core.complete_workflow_activation(completion(&run_id, vec![cancel_activity(1)], false, true))
+        .await
+        .unwrap();
+    let act = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(resolved_seq(&act).as_slice(), [r] if r.contains("Cancelled"));
+    core.complete_workflow_activation(completion(&run_id, vec![], false, true))
+        .await
+        .unwrap();
+    // Nothing the workflow waits on is in flight anymore, so the window checkpoints
+    let wtc = completions.recv().await.unwrap();
+    assert_eq!(
+        describe(&wtc.commands),
+        [
+            "schedule act-1 optimistic",
+            "timer 2 optimistic",
+            "fire 2",
+            "cancel 5"
+        ]
+    );
+    let cancel = core.poll_activity_task().await.unwrap();
+    assert_eq!(cancel.task_token, token.clone().into_inner());
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: token.into_inner(),
+        result: Some(ActivityExecutionResult::cancel_from_details(None)),
+    })
+    .await
+    .unwrap();
+
+    drain_pollers_and_shutdown(&core).await;
+}
+
+/// A workflow waiting for the cancellation of an optimistic activity observes it inside the
+/// window, recorded as a canceled resolution after the cancel request.
+#[tokio::test]
+async fn wait_cancellation_completed_resolves_in_window() {
+    let (core, mut completions) = optimistic_worker(
+        history(Duration::from_secs(10)),
+        mock_worker_client(),
+        Box::new(|_| RespondWorkflowTaskCompletedResponse::default()),
+    )
+    .await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    let run_id = act.run_id.clone();
+    core.complete_workflow_activation(completion(
+        &run_id,
+        vec![
+            speculative_activity_with(
+                &core,
+                1,
+                ActivityCancellationType::WaitCancellationCompleted,
+            ),
+            speculative_timer(2, Duration::from_millis(10)),
+        ],
+        false,
+        true,
+    ))
+    .await
+    .unwrap();
+    let (token, _) = poll_start(&core).await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(resolved_seq(&act), ["timer-2"]);
+    core.complete_workflow_activation(completion(&run_id, vec![cancel_activity(1)], false, true))
+        .await
+        .unwrap();
+    let cancel = core.poll_activity_task().await.unwrap();
+    assert_matches!(cancel.variant, Some(activity_task::Variant::Cancel(_)));
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: token.into_inner(),
+        result: Some(ActivityExecutionResult::cancel_from_details(None)),
+    })
+    .await
+    .unwrap();
+    let act = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(resolved_seq(&act).as_slice(), [r] if r.contains("Cancelled"));
+    core.complete_workflow_activation(completion(&run_id, vec![complete_workflow()], true, false))
+        .await
+        .unwrap();
+    let wtc = completions.recv().await.unwrap();
+    assert_eq!(
+        describe(&wtc.commands),
+        [
+            "schedule act-1 optimistic",
+            "timer 2 optimistic",
+            "fire 2",
+            "cancel 5",
+            "resolve 5 canceled",
+            "complete"
+        ]
+    );
+    drain_pollers_and_shutdown(&core).await;
+}
+
+/// A result that doesn't fit the payload budget isn't delivered in the window. The window
+/// checkpoints and the result is reported through the normal RPC.
+#[tokio::test]
+async fn payload_budget_checkpoints() {
+    let big = Payload {
+        data: vec![b'x'; 2048],
+        ..Default::default()
+    };
+    let expected = big.clone();
+    let mut client = mock_worker_client();
+    client
+        .expect_complete_activity_task()
+        .withf(move |token, res| {
+            *token == TaskToken::from(b"real-1".to_vec())
+                && res.as_ref().map(|p| p.payloads.clone()) == Some(vec![expected.clone()])
+        })
+        .times(1)
+        .returning(|_, _| Ok(RespondActivityTaskCompletedResponse::default()));
+    let (core, mut completions) = optimistic_worker_with(
+        history(Duration::from_secs(10)),
+        client,
+        Box::new(|_| {
+            Ok(RespondWorkflowTaskCompletedResponse {
+                optimistic_activity_tasks: vec![handed_off("act-1", b"real-1")],
+                ..Default::default()
+            })
+        }),
+        |wc| wc.optimistic_start_payload_budget = 1024,
+    )
+    .await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    let run_id = act.run_id.clone();
+    core.complete_workflow_activation(completion(
+        &run_id,
+        vec![speculative_activity(&core, 1)],
+        false,
+        true,
+    ))
+    .await
+    .unwrap();
+    let poller = idle_workflow_poller(core.clone());
+    let (token, _) = poll_start(&core).await;
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: token.into_inner(),
+        result: Some(ActivityExecutionResult::ok(big)),
+    })
+    .await
+    .unwrap();
+    let wtc = completions.recv().await.unwrap();
+    assert_eq!(describe(&wtc.commands), ["schedule act-1 optimistic"]);
+    shutdown_with_poller(core, poller).await;
+}
+
+/// When the server rejects the checkpoint, local executions are cancelled, their outcomes are
+/// dropped, and the batch is never sent again.
+#[tokio::test]
+async fn rejected_checkpoint_drops_window() {
+    let (core, mut completions) = optimistic_worker_with(
+        history(Duration::from_secs(10)),
+        mock_worker_client(),
+        Box::new(|_| Err(tonic::Status::invalid_argument("UnhandledCommand"))),
+        |_| {},
+    )
+    .await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    let run_id = act.run_id.clone();
+    core.complete_workflow_activation(completion(
+        &run_id,
+        vec![
+            speculative_activity(&core, 1),
+            speculative_timer(2, Duration::from_millis(10)),
+        ],
+        false,
+        true,
+    ))
+    .await
+    .unwrap();
+    let (token, _) = poll_start(&core).await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(resolved_seq(&act), ["timer-2"]);
+    core.complete_workflow_activation(completion(&run_id, vec![complete_workflow()], false, true))
+        .await
+        .unwrap();
+    completions.recv().await.unwrap();
+    let cancel = core.poll_activity_task().await.unwrap();
+    assert_eq!(cancel.task_token, token.clone().into_inner());
+    // No activity RPC is expected for the discarded outcome
+    complete_activity(&core, &token, 1).await;
+    drain_pollers_and_shutdown(&core).await;
+    assert!(completions.try_recv().is_err());
+}
+
+/// Exiting a block and entering the next in the same activation keeps the window going.
+#[tokio::test]
+async fn sequential_blocks_share_window() {
+    let (core, mut completions) = optimistic_worker(
+        history(Duration::from_secs(10)),
+        mock_worker_client(),
+        Box::new(|_| RespondWorkflowTaskCompletedResponse::default()),
+    )
+    .await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    let run_id = act.run_id.clone();
+    core.complete_workflow_activation(completion(
+        &run_id,
+        vec![speculative_activity(&core, 1)],
+        false,
+        true,
+    ))
+    .await
+    .unwrap();
+    let (token, _) = poll_start(&core).await;
+    complete_activity(&core, &token, 1).await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(resolved_seq(&act), ["act-1"]);
+    core.complete_workflow_activation(completion(
+        &run_id,
+        vec![speculative_activity(&core, 2)],
+        true,
+        true,
+    ))
+    .await
+    .unwrap();
+    let (token, _) = poll_start(&core).await;
+    complete_activity(&core, &token, 2).await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(resolved_seq(&act), ["act-2"]);
+    core.complete_workflow_activation(completion(&run_id, vec![complete_workflow()], true, false))
+        .await
+        .unwrap();
+    let wtc = completions.recv().await.unwrap();
+    assert_eq!(
+        describe(&wtc.commands),
+        [
+            "schedule act-1 optimistic",
+            "resolve 5 completed",
+            "schedule act-2 optimistic",
+            "resolve 8 completed",
+            "complete"
+        ]
+    );
+    drain_pollers_and_shutdown(&core).await;
+}
+
+/// A local activity scheduled while a window is open checkpoints it, requesting a new workflow
+/// task like a local activity heartbeat does.
+#[tokio::test]
+async fn local_activity_checkpoints_window() {
+    let (core, mut completions) = optimistic_worker(
+        history(Duration::from_secs(10)),
+        mock_worker_client(),
+        Box::new(|_| RespondWorkflowTaskCompletedResponse::default()),
+    )
+    .await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    let run_id = act.run_id.clone();
+    core.complete_workflow_activation(completion(
+        &run_id,
+        vec![speculative_timer(1, Duration::from_millis(10))],
+        false,
+        true,
+    ))
+    .await
+    .unwrap();
+    let act = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(resolved_seq(&act), ["timer-1"]);
+    core.complete_workflow_activation(completion(
+        &run_id,
+        vec![schedule_local_activity_cmd(
+            2,
+            "la-2",
+            ActivityCancellationType::TryCancel,
+            Duration::from_secs(10),
+        )],
+        true,
+        false,
+    ))
+    .await
+    .unwrap();
+    let wtc = completions.recv().await.unwrap();
+    assert_eq!(describe(&wtc.commands), ["timer 1 optimistic", "fire 1"]);
+    assert!(wtc.force_create_new_workflow_task);
+    let la = core.poll_activity_task().await.unwrap();
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: la.task_token,
+        result: Some(ActivityExecutionResult::ok(result(2))),
+    })
+    .await
+    .unwrap();
     drain_pollers_and_shutdown(&core).await;
 }

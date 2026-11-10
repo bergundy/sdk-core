@@ -122,6 +122,7 @@ async fn timer_workflow_replay() {
             StartTimer {
                 seq: 0,
                 start_to_fire_timeout: Some(prost_dur!(from_secs(1))),
+                ..Default::default()
             }
             .into(),
         ],
