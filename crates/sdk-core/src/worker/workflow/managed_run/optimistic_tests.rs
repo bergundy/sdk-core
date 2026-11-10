@@ -2,6 +2,7 @@
 
 use super::WorkflowManager;
 use crate::{
+    internal_flags::CoreInternalFlags,
     replay::{DEFAULT_ACTIVITY_TYPE, DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder},
     telemetry::metrics::MetricsContext,
     test_help::test_worker_cfg,
@@ -9,22 +10,24 @@ use crate::{
 };
 use std::time::{Duration, SystemTime};
 use temporalio_common::protos::{
+    VERSION_SEARCH_ATTR_KEY,
     coresdk::{
         AsJsonPayloadExt, IntoPayloadsExt,
         activity_result::activity_resolution,
         workflow_activation::{WorkflowActivation, workflow_activation_job::Variant},
         workflow_commands::{
             ActivityCancellationType, CompleteWorkflowExecution, RequestCancelActivity,
-            ScheduleActivity, StartTimer,
+            ScheduleActivity, SetPatchMarker, StartTimer,
         },
     },
     temporal::api::{
-        common::v1::{ActivityType, Payload},
+        common::v1::{ActivityType, Payload, SearchAttributes},
         enums::v1::EventType,
         history::v1::{
             ActivityTaskCompletedEventAttributes, ActivityTaskScheduledEventAttributes,
             ActivityTaskStartedEventAttributes, OptimisticResolution, OptimisticStartInfo,
             TimerFiredEventAttributes, TimerStartedEventAttributes,
+            UpsertWorkflowSearchAttributesEventAttributes,
         },
     },
 };
@@ -70,6 +73,13 @@ fn timer(seq: u32) -> WFCommand {
         seq,
         start_to_fire_timeout: Some(Duration::from_secs(3).try_into().unwrap()),
         speculative: true,
+    }))
+}
+
+fn deprecate_patch(patch_id: &str) -> WFCommand {
+    WFCommand::new(WFCommandVariant::SetPatchMarker(SetPatchMarker {
+        patch_id: patch_id.to_owned(),
+        deprecated: true,
     }))
 }
 
@@ -172,6 +182,8 @@ fn job_names(activation: &WorkflowActivation) -> Vec<String> {
     activation
         .jobs
         .iter()
+        // Patch notifications don't affect what these workflows do
+        .filter(|job| !matches!(job.variant, Some(Variant::NotifyHasPatch(_))))
         .map(|job| match job.variant.as_ref().unwrap() {
             Variant::InitializeWorkflow(_) => "init".to_owned(),
             Variant::SignalWorkflow(_) => "signal".to_owned(),
@@ -475,4 +487,75 @@ fn replays_observed_cancellation() {
         jobs,
         [vec!["init"], vec!["timer-2"], vec!["act-1-cancelled"]]
     );
+}
+
+/// A workflow that deprecates patches inside a window: before its first optimistic command, and
+/// between two resolutions.
+fn deprecating_workflow(jobs: &[String]) -> Vec<WFCommand> {
+    match jobs {
+        [j] if j == "init" => vec![deprecate_patch("p1"), schedule(1)],
+        [j] if j == "act-1" => vec![deprecate_patch("p2"), timer(2)],
+        [j] if j == "timer-2" => vec![complete()],
+        other => panic!("unexpected jobs {other:?}"),
+    }
+}
+
+/// Without the patch calls.
+fn patch_free_workflow(jobs: &[String]) -> Vec<WFCommand> {
+    deprecating_workflow(jobs)
+        .into_iter()
+        .filter(|c| !matches!(c.variant, WFCommandVariant::SetPatchMarker(_)))
+        .collect()
+}
+
+/// The history recorded by [deprecating_workflow], or by [patch_free_workflow] if
+/// `with_markers` is false.
+fn deprecated_patch_history(with_markers: bool) -> TestHistoryBuilder {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    let wft_started = add_full_wf_task_returning_start(&mut t);
+    let add_marker = |t: &mut TestHistoryBuilder, patch_ids: &[&str]| {
+        if !with_markers {
+            return;
+        }
+        t.add_has_change_marker(patch_ids.last().unwrap(), true);
+        t.add(UpsertWorkflowSearchAttributesEventAttributes {
+            search_attributes: Some(SearchAttributes {
+                indexed_fields: [(
+                    VERSION_SEARCH_ATTR_KEY.to_owned(),
+                    patch_ids.as_json_payload().unwrap(),
+                )]
+                .into(),
+            }),
+            ..Default::default()
+        });
+    };
+    add_marker(&mut t, &["p1"]);
+    let a1 = t.add_optimistic_scheduled(1);
+    t.add_activity_resolution(a1, 1, Some(wft_started + Duration::from_millis(100)));
+    add_marker(&mut t, &["p1", "p2"]);
+    let timer_started = t.add_optimistic_timer_started(2);
+    t.add_optimistic_timer_fired(timer_started, 2, wft_started + Duration::from_millis(200));
+    t.add_workflow_execution_completed();
+    if with_markers {
+        t.set_flags_first_wft(&[CoreInternalFlags::UpsertSearchAttributeOnPatch], &[]);
+    }
+    t
+}
+
+/// Replay skips deprecated patch markers missing from history, and deprecated markers the code no
+/// longer produces, so neither may count when lining up a window's commands with its history.
+#[rstest::rstest]
+#[case::markers_in_history_and_code(true, deprecating_workflow)]
+#[case::code_deprecates_patches_missing_from_history(false, deprecating_workflow)]
+#[case::history_has_markers_code_dropped(true, patch_free_workflow)]
+#[case::no_markers(false, patch_free_workflow)]
+fn replays_deprecated_patches_in_window(
+    #[case] with_markers: bool,
+    #[case] workflow: fn(&[String]) -> Vec<WFCommand>,
+) {
+    let history = deprecated_patch_history(with_markers);
+    let activations = replay(&history, workflow).unwrap();
+    let jobs: Vec<_> = activations.iter().map(|a| a.jobs.clone()).collect();
+    assert_eq!(jobs, [vec!["init"], vec!["act-1"], vec!["timer-2"]]);
 }
