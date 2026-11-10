@@ -176,9 +176,30 @@ pub(crate) trait HistoryEventExt {
     /// If this history event represents a local activity marker, return all the contained data.
     /// Returns `None` if it is any other kind of event or marker or the data is invalid.
     fn into_local_activity_marker_details(self) -> Option<CompleteLocalActivityData>;
+    /// True if this event was written from a `ResolveOptimisticActivity` or `FireOptimisticTimer`
+    /// command, meaning the workflow already observed it in the workflow task that produced it.
+    fn is_optimistic_resolution(&self) -> bool;
 }
 
 impl HistoryEventExt for HistoryEvent {
+    fn is_optimistic_resolution(&self) -> bool {
+        match &self.attributes {
+            Some(history_event::Attributes::ActivityTaskStartedEventAttributes(a)) => {
+                a.optimistic_resolution
+            }
+            Some(history_event::Attributes::ActivityTaskCompletedEventAttributes(a)) => {
+                a.optimistic_resolution.is_some()
+            }
+            Some(history_event::Attributes::ActivityTaskCanceledEventAttributes(a)) => {
+                a.optimistic_resolution.is_some()
+            }
+            Some(history_event::Attributes::TimerFiredEventAttributes(a)) => {
+                a.optimistic_resolution.is_some()
+            }
+            _ => false,
+        }
+    }
+
     fn get_patch_marker_details(&self) -> Option<(String, bool)> {
         if self.event_type() == EventType::MarkerRecorded {
             match &self.attributes {

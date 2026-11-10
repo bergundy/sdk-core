@@ -48,6 +48,18 @@ fsm! {
         shared on_activity_task_scheduled) --> ScheduledEventRecorded;
     ScheduleCommandCreated --(Cancel, shared on_canceled) --> Canceled;
     ScheduleCommandCreated --(Abandon, shared on_abandoned) --> Canceled;
+    // An optimistically started activity already is in the command list sent at the checkpoint,
+    // and later commands' event ids depend on it, so cancelling it must not remove the command.
+    ScheduleCommandCreated --(OptimisticCancel, shared on_optimistic_canceled)
+      --> OptimisticCancelCommandCreated;
+    ScheduleCommandCreated --(OptimisticAbandon, on_optimistic_abandoned) --> OptimisticAbandoned;
+
+    OptimisticCancelCommandCreated --(CommandRequestCancelActivityTask)
+      --> OptimisticCancelCommandCreated;
+    OptimisticCancelCommandCreated --(ActivityTaskScheduled(ActTaskScheduledData),
+        shared on_activity_task_scheduled) --> ScheduledActivityCancelCommandCreated;
+    OptimisticAbandoned --(ActivityTaskScheduled(ActTaskScheduledData),
+        shared on_activity_task_scheduled) --> Canceled;
 
     ScheduledEventRecorded --(ActivityTaskStarted(i64), shared on_task_started) --> Started;
     ScheduledEventRecorded --(ActivityTaskTimedOut(ActivityTaskTimedOutEventAttributes),
@@ -102,6 +114,14 @@ pub(super) enum ActivityMachineCommand {
     RequestCancellation(Command),
 }
 
+/// An outcome of an optimistically started activity that the workflow observes during the
+/// workflow task that started it, before the events recording it are applied.
+#[derive(Debug, Clone)]
+pub(crate) enum OptimisticActivityOutcome {
+    Completed(Option<Payloads>),
+    Canceled(ActivityTaskCanceledEventAttributes),
+}
+
 pub(super) struct ActTaskScheduledData {
     event_id: i64,
     act_type: String,
@@ -128,6 +148,8 @@ impl ActivityMachine {
                 started_event_id: 0,
                 cancelled_before_sent: false,
                 annotations,
+                optimistic_scheduled_event_id: None,
+                resolved_optimistically: false,
             },
         );
         OnEventWrapper::on_event_mut(&mut s, ActivityMachineEvents::Schedule)
@@ -198,9 +220,23 @@ impl ActivityMachine {
             );
             return Ok(vec![]);
         }
-        let event = match self.shared_state.cancellation_type {
-            ActivityCancellationType::Abandon => ActivityMachineEvents::Abandon,
-            _ => ActivityMachineEvents::Cancel,
+        if self.shared_state.resolved_optimistically {
+            debug!(
+                "Attempted to cancel already resolved optimistic activity (seq {})",
+                self.shared_state.attrs.seq
+            );
+            return Ok(vec![]);
+        }
+        let optimistic = self.shared_state.optimistic_scheduled_event_id.is_some()
+            && matches!(
+                self.state(),
+                ActivityMachineState::ScheduleCommandCreated(_)
+            );
+        let event = match (self.shared_state.cancellation_type, optimistic) {
+            (ActivityCancellationType::Abandon, false) => ActivityMachineEvents::Abandon,
+            (ActivityCancellationType::Abandon, true) => ActivityMachineEvents::OptimisticAbandon,
+            (_, false) => ActivityMachineEvents::Cancel,
+            (_, true) => ActivityMachineEvents::OptimisticCancel,
         };
         let vec = OnEventWrapper::on_event_mut(self, event)?;
         let res = vec
@@ -223,6 +259,104 @@ impl ActivityMachine {
 
     pub(super) fn was_cancelled_before_sent_to_server(&self) -> bool {
         self.shared_state().cancelled_before_sent
+    }
+
+    pub(super) fn seq(&self) -> u32 {
+        self.shared_state.attrs.seq
+    }
+
+    pub(super) fn attrs(&self) -> &ScheduleActivity {
+        &self.shared_state.attrs
+    }
+
+    /// Marks the activity as started optimistically, with the scheduled event id Core predicted
+    /// for it. Only valid before the schedule command has been recorded.
+    pub(super) fn set_optimistic(&mut self, predicted_scheduled_event_id: i64) {
+        self.shared_state.optimistic_scheduled_event_id = Some(predicted_scheduled_event_id);
+        self.shared_state.scheduled_event_id = predicted_scheduled_event_id;
+    }
+
+    pub(super) fn optimistic_scheduled_event_id(&self) -> Option<i64> {
+        self.shared_state.optimistic_scheduled_event_id
+    }
+
+    pub(super) fn resolved_optimistically(&self) -> bool {
+        self.shared_state.resolved_optimistically
+    }
+
+    pub(super) fn is_abandon(&self) -> bool {
+        self.shared_state.cancellation_type == ActivityCancellationType::Abandon
+    }
+
+    /// True while the workflow may still observe an outcome of this optimistic activity during
+    /// the current workflow task.
+    pub(super) fn awaiting_optimistic_outcome(&self) -> bool {
+        self.shared_state.optimistic_scheduled_event_id.is_some()
+            && !self.shared_state.resolved_optimistically
+            && match self.state() {
+                ActivityMachineState::ScheduleCommandCreated(_) => true,
+                ActivityMachineState::OptimisticCancelCommandCreated(_) => {
+                    self.shared_state.cancellation_type
+                        == ActivityCancellationType::WaitCancellationCompleted
+                }
+                _ => false,
+            }
+    }
+
+    /// Whether the workflow would observe this outcome if it arrived now. Outcomes the workflow
+    /// can't observe are reported to the server after the checkpoint instead.
+    pub(super) fn optimistic_outcome_observable(
+        &self,
+        outcome: &OptimisticActivityOutcome,
+    ) -> bool {
+        if !self.awaiting_optimistic_outcome() {
+            return false;
+        }
+        let cancel_requested = matches!(
+            self.state(),
+            ActivityMachineState::OptimisticCancelCommandCreated(_)
+        );
+        match outcome {
+            OptimisticActivityOutcome::Completed(_) => true,
+            OptimisticActivityOutcome::Canceled(_) => cancel_requested,
+        }
+    }
+
+    /// Resolves the activity with an outcome the workflow observes during the workflow task that
+    /// started it. The events recording the outcome are applied later without producing jobs.
+    pub(super) fn resolve_optimistically(
+        &mut self,
+        outcome: OptimisticActivityOutcome,
+    ) -> Result<Vec<MachineResponse>, WFMachinesError> {
+        if self.shared_state.resolved_optimistically {
+            return Err(fatal!(
+                "Optimistic activity (seq {}) was resolved twice",
+                self.shared_state.attrs.seq
+            ));
+        }
+        self.shared_state.resolved_optimistically = true;
+        let status = match outcome {
+            OptimisticActivityOutcome::Completed(result) => {
+                activity_resolution::Status::Completed(ar::Success {
+                    result: convert_payloads(None, result)?,
+                })
+            }
+            OptimisticActivityOutcome::Canceled(attrs) => {
+                activity_resolution::Status::Cancelled(Cancellation {
+                    failure: Some(new_cancel_failure(&self.shared_state, attrs)),
+                })
+            }
+        };
+        Ok(vec![
+            ResolveActivity {
+                seq: self.shared_state.attrs.seq,
+                result: Some(ActivityResolution {
+                    status: Some(status),
+                }),
+                is_local: false,
+            }
+            .into(),
+        ])
     }
 }
 
@@ -363,6 +497,12 @@ pub(super) struct SharedState {
     cancelled_before_sent: bool,
     internal_flags: InternalFlagsRef,
     annotations: CommandAnnotations,
+    /// Set if the activity was started optimistically inside a speculation window, to the
+    /// scheduled event id predicted for it.
+    optimistic_scheduled_event_id: Option<i64>,
+    /// Set once the workflow observed an outcome of the optimistic activity before the events
+    /// recording it were applied.
+    resolved_optimistically: bool,
 }
 
 #[derive(Default, Clone)]
@@ -378,35 +518,64 @@ impl Created {
 #[derive(Default, Clone)]
 pub(super) struct ScheduleCommandCreated {}
 
+fn record_scheduled_event<S: Default + Into<ActivityMachineState>>(
+    dat: &mut SharedState,
+    sched_dat: ActTaskScheduledData,
+) -> ActivityMachineTransition<S> {
+    if dat.internal_flags.borrow_mut().try_use(
+        CoreInternalFlags::IdAndTypeDeterminismChecks,
+        sched_dat.last_task_in_history,
+    ) {
+        if sched_dat.act_id != dat.attrs.activity_id {
+            return TransitionResult::Err(nondeterminism!(
+                "Activity id of scheduled event '{}' does not \
+             match activity id of activity command '{}'",
+                sched_dat.act_id,
+                dat.attrs.activity_id
+            ));
+        }
+        if sched_dat.act_type != dat.attrs.activity_type {
+            return TransitionResult::Err(nondeterminism!(
+                "Activity type of scheduled event '{}' does not \
+             match activity type of activity command '{}'",
+                sched_dat.act_type,
+                dat.attrs.activity_type
+            ));
+        }
+    }
+    if let Some(predicted) = dat.optimistic_scheduled_event_id
+        && predicted != sched_dat.event_id
+    {
+        return TransitionResult::Err(nondeterminism!(
+            "Optimistic activity '{}' was predicted to be scheduled at event {} but was \
+             scheduled at event {}",
+            dat.attrs.activity_id,
+            predicted,
+            sched_dat.event_id
+        ));
+    }
+    dat.scheduled_event_id = sched_dat.event_id;
+    ActivityMachineTransition::default()
+}
+
 impl ScheduleCommandCreated {
     pub(super) fn on_activity_task_scheduled(
         self,
         dat: &mut SharedState,
         sched_dat: ActTaskScheduledData,
     ) -> ActivityMachineTransition<ScheduledEventRecorded> {
-        if dat.internal_flags.borrow_mut().try_use(
-            CoreInternalFlags::IdAndTypeDeterminismChecks,
-            sched_dat.last_task_in_history,
-        ) {
-            if sched_dat.act_id != dat.attrs.activity_id {
-                return TransitionResult::Err(nondeterminism!(
-                    "Activity id of scheduled event '{}' does not \
-                 match activity id of activity command '{}'",
-                    sched_dat.act_id,
-                    dat.attrs.activity_id
-                ));
-            }
-            if sched_dat.act_type != dat.attrs.activity_type {
-                return TransitionResult::Err(nondeterminism!(
-                    "Activity type of scheduled event '{}' does not \
-                 match activity type of activity command '{}'",
-                    sched_dat.act_type,
-                    dat.attrs.activity_type
-                ));
-            }
-        }
-        dat.scheduled_event_id = sched_dat.event_id;
-        ActivityMachineTransition::default()
+        record_scheduled_event(dat, sched_dat)
+    }
+
+    pub(super) fn on_optimistic_canceled(
+        self,
+        dat: &mut SharedState,
+    ) -> ActivityMachineTransition<OptimisticCancelCommandCreated> {
+        create_request_cancel_activity_task_command(dat, OptimisticCancelCommandCreated::default())
+    }
+
+    pub(super) fn on_optimistic_abandoned(self) -> ActivityMachineTransition<OptimisticAbandoned> {
+        ActivityMachineTransition::commands(vec![ActivityMachineCommand::Cancel(None)])
     }
 
     pub(super) fn on_canceled(self, dat: &mut SharedState) -> ActivityMachineTransition<Canceled> {
@@ -423,6 +592,32 @@ impl ScheduleCommandCreated {
     pub(super) fn on_abandoned(self, dat: &mut SharedState) -> ActivityMachineTransition<Canceled> {
         dat.cancelled_before_sent = true;
         notify_lang_activity_cancelled(None)
+    }
+}
+
+#[derive(Default, Clone)]
+pub(super) struct OptimisticCancelCommandCreated {}
+
+impl OptimisticCancelCommandCreated {
+    pub(super) fn on_activity_task_scheduled(
+        self,
+        dat: &mut SharedState,
+        sched_dat: ActTaskScheduledData,
+    ) -> ActivityMachineTransition<ScheduledActivityCancelCommandCreated> {
+        record_scheduled_event(dat, sched_dat)
+    }
+}
+
+#[derive(Default, Clone)]
+pub(super) struct OptimisticAbandoned {}
+
+impl OptimisticAbandoned {
+    pub(super) fn on_activity_task_scheduled(
+        self,
+        dat: &mut SharedState,
+        sched_dat: ActTaskScheduledData,
+    ) -> ActivityMachineTransition<Canceled> {
+        record_scheduled_event(dat, sched_dat)
     }
 }
 
@@ -945,6 +1140,8 @@ mod test {
                     cancelled_before_sent: false,
                     internal_flags: Rc::new(RefCell::new(InternalFlags::default())),
                     annotations: Default::default(),
+                    optimistic_scheduled_event_id: None,
+                    resolved_optimistically: false,
                 },
             );
             let cmds = s.cancel(Default::default()).unwrap();
