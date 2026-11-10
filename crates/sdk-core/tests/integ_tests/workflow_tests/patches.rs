@@ -1011,18 +1011,21 @@ async fn same_change_multiple_spots(#[case] have_marker_in_hist: bool, #[case] r
         t.add(TimerFiredEventAttributes {
             started_event_id: timer_started_event_id,
             timer_id: "1".to_owned(),
+            ..Default::default()
         });
     } else {
         let started_event_id = t.add_by_type(EventType::TimerStarted);
         t.add(TimerFiredEventAttributes {
             started_event_id,
             timer_id: "1".to_owned(),
+            ..Default::default()
         });
         t.add_full_wf_task();
         let timer_started_event_id = t.add_by_type(EventType::TimerStarted);
         t.add(TimerFiredEventAttributes {
             started_event_id: timer_started_event_id,
             timer_id: "2".to_owned(),
+            ..Default::default()
         });
     }
     t.add_full_wf_task();
@@ -1049,6 +1052,7 @@ async fn same_change_multiple_spots(#[case] have_marker_in_hist: bool, #[case] r
         t.add(TimerFiredEventAttributes {
             started_event_id,
             timer_id: "3".to_owned(),
+            ..Default::default()
         });
     }
     t.add_full_wf_task();
@@ -1108,6 +1112,7 @@ async fn many_patches_combine_in_search_attrib_update(#[case] num_patches: usize
         t.add(TimerFiredEventAttributes {
             started_event_id: timer_started_event_id,
             timer_id: i.to_string(),
+            ..Default::default()
         });
         t.add_full_wf_task();
     }
