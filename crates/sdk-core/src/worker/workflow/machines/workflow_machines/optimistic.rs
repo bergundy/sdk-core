@@ -31,7 +31,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use temporalio_common::protos::{
-    TaskToken,
+    TaskToken, VERSION_SEARCH_ATTR_KEY,
     coresdk::activity_result::{Cancellation, Success, activity_execution_result},
     temporal::api::{
         command::v1::{
@@ -282,6 +282,22 @@ impl WorkflowMachines {
         }
     }
 
+    /// Patch markers, and the search attribute upserts Core adds with them, may be skipped by
+    /// replay on either side: a deprecated patch call may have no marker in history, and a
+    /// deprecated marker in history may have no call. They're left out when lining up a window's
+    /// commands with the events recording them, which can't otherwise tell the cases apart. See
+    /// [is_patch_event] for the history side.
+    fn is_patch_command(&self, c: &CommandAndMachine) -> bool {
+        match (c.command.attributes.as_ref(), self.machine(c.machine)) {
+            (_, Machines::PatchMachine(_)) => true,
+            (Some(ProtoCmdAttrs::UpsertWorkflowSearchAttributesCommandAttributes(a)), _) => a
+                .search_attributes
+                .as_ref()
+                .is_some_and(|sa| sa.indexed_fields.contains_key(VERSION_SEARCH_ATTR_KEY)),
+            _ => false,
+        }
+    }
+
     fn is_speculative_candidate(&self, c: &CommandAndMachine) -> bool {
         match (c.command.attributes.as_ref(), self.machine(c.machine)) {
             (
@@ -330,19 +346,32 @@ impl WorkflowMachines {
         let peeked = self
             .last_history_from_server
             .peek_next_wft_sequence(self.current_started_event_id);
+        // Commands are recorded in order, so the n-th command lines up with the n-th command
+        // event. Patch markers are left out on both sides, since replay may skip them on either.
+        let earlier_commands = self
+            .commands
+            .iter()
+            .take(first_new)
+            .filter(|c| !self.is_patch_command(c))
+            .count();
+        let mut command_events = peeked
+            .iter()
+            .filter(|e| e.is_command_event() && !is_patch_event(e))
+            .skip(earlier_commands);
         let mut marks = vec![];
-        for ix in first_new..self.commands.len() {
-            let c = &self.commands[ix];
-            let predicted = self.predicted_event_id(ix);
-            let Some(event) = peeked.iter().find(|e| e.event_id == predicted) else {
+        for c in self.commands.iter().skip(first_new) {
+            if self.is_patch_command(c) {
                 continue;
+            }
+            let Some(event) = command_events.next() else {
+                break;
             };
             match (c.command.attributes.as_ref(), event.attributes.as_ref()) {
                 (
                     Some(ProtoCmdAttrs::ScheduleActivityTaskCommandAttributes(cmd)),
                     Some(history_event::Attributes::ActivityTaskScheduledEventAttributes(ev)),
                 ) if ev.optimistic_start.is_some() && ev.activity_id == cmd.activity_id => {
-                    marks.push((c.machine, Some(predicted)));
+                    marks.push((c.machine, Some(event.event_id)));
                 }
                 (
                     Some(ProtoCmdAttrs::StartTimerCommandAttributes(cmd)),
@@ -389,7 +418,11 @@ impl WorkflowMachines {
         .nth(self.optimistic.delivered.len()) else {
             return Ok(());
         };
-        let produced = self.commands.len();
+        let produced = self
+            .commands
+            .iter()
+            .filter(|c| !self.is_patch_command(c))
+            .count();
         if produced != next.commands_before {
             return Err(nondeterminism!(
                 "History recorded an optimistic resolution of {:?} after {} commands, but the \
@@ -425,7 +458,7 @@ impl WorkflowMachines {
         }
         self.process_machine_responses(mk, resps)?;
         self.optimistic.delivered.push(DeliveredResolution {
-            after_commands: produced,
+            after_commands: self.commands.len(),
             event_count,
             command: None,
         });
@@ -989,13 +1022,16 @@ fn cancel_details(failure: Option<Failure>) -> Option<Payloads> {
 }
 
 /// Finds the resolutions the workflow observed during the workflow task that produced the given
-/// sequence, in order, with the number of command events recorded before each.
+/// sequence, in order, with the number of command events recorded before each, not counting
+/// patch markers (see [WorkflowMachines::is_patch_command]).
 fn peek_resolutions(events: &[HistoryEvent]) -> Vec<PeekedResolution> {
     let mut commands = 0;
     let mut out = vec![];
     for e in events {
         if e.is_command_event() {
-            commands += 1;
+            if !is_patch_event(e) {
+                commands += 1;
+            }
             continue;
         }
         if !e.is_optimistic_resolution() {
@@ -1038,4 +1074,15 @@ fn peek_resolutions(events: &[HistoryEvent]) -> Vec<PeekedResolution> {
         });
     }
     out
+}
+
+/// The history side of [WorkflowMachines::is_patch_command].
+fn is_patch_event(e: &HistoryEvent) -> bool {
+    match &e.attributes {
+        Some(history_event::Attributes::UpsertWorkflowSearchAttributesEventAttributes(a)) => a
+            .search_attributes
+            .as_ref()
+            .is_some_and(|sa| sa.indexed_fields.contains_key(VERSION_SEARCH_ATTR_KEY)),
+        _ => e.get_patch_marker_details().is_some(),
+    }
 }
