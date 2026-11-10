@@ -81,6 +81,7 @@ pub mod coresdk {
                     commands: v,
                     used_internal_flags: vec![],
                     versioning_behavior: VersioningBehavior::Unspecified.into(),
+                    ..Default::default()
                 }
             }
         }
@@ -1847,6 +1848,12 @@ pub mod temporal {
                             Attributes::RequestCancelNexusOperationCommandAttributes(_) => {
                                 CommandType::RequestCancelNexusOperation
                             }
+                            Attributes::ResolveOptimisticActivityCommandAttributes(_) => {
+                                CommandType::ResolveOptimisticActivity
+                            }
+                            Attributes::FireOptimisticTimerCommandAttributes(_) => {
+                                CommandType::FireOptimisticTimer
+                            }
                         }
                         }
                     }
@@ -1862,6 +1869,7 @@ pub mod temporal {
                             Self::StartTimerCommandAttributes(StartTimerCommandAttributes {
                                 timer_id: s.seq.to_string(),
                                 start_to_fire_timeout: s.start_to_fire_timeout,
+                                optimistic_start: None,
                             })
                         }
                     }
@@ -1915,6 +1923,7 @@ pub mod temporal {
                                 request_eager_execution: !s.do_not_eagerly_execute,
                                 use_workflow_build_id,
                                 priority: s.priority,
+                                optimistic_start: None,
                             },
                         )
                     }
