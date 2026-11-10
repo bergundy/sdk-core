@@ -33,6 +33,10 @@ relevant information.
 
 ## Unreleased
 
+### Changed
+* Workflow task completions set `resource_id` to `workflow:<workflow_id>`, on every page of a
+  paginated completion, so proxies can identify the workflow without decoding the task token.
+
 ### Added
 * A local activity's `ActivityTask.Start` has `workflow_task` (field 21), with the started event
   id, attempt and start time of the workflow task in which Core dispatched it. `workflow_task`
