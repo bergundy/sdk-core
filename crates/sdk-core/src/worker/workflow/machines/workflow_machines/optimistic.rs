@@ -668,6 +668,12 @@ impl WorkflowMachines {
         attrs: &ScheduleActivityTaskCommandAttributes,
     ) -> PollActivityTaskQueueResponse {
         let now = SystemTime::now();
+        let timeouts = ActivityTimeouts::normalized(
+            attrs,
+            self.get_started_info()
+                .and_then(|i| i.workflow_run_timeout)
+                .unwrap_or_default(),
+        );
         PollActivityTaskQueueResponse {
             workflow_namespace: self.worker_config.namespace.clone(),
             workflow_type: Some(WorkflowType {
@@ -688,11 +694,9 @@ impl WorkflowMachines {
             current_attempt_scheduled_time: Some(now.into()),
             started_time: Some(now.into()),
             attempt: 1,
-            schedule_to_close_timeout: attrs.schedule_to_close_timeout,
-            start_to_close_timeout: attrs
-                .start_to_close_timeout
-                .or(attrs.schedule_to_close_timeout),
-            heartbeat_timeout: attrs.heartbeat_timeout,
+            schedule_to_close_timeout: Some(timeouts.schedule_to_close),
+            start_to_close_timeout: Some(timeouts.start_to_close),
+            heartbeat_timeout: Some(timeouts.heartbeat),
             retry_policy: attrs.retry_policy.clone(),
             priority: attrs.priority.clone(),
             ..Default::default()
@@ -989,6 +993,49 @@ impl WorkflowMachines {
                 env.cancel_timer(&self.run_id, w.generation, m.seq());
             }
             _ => {}
+        }
+    }
+}
+
+/// Activity timeouts as the server fills them in when it schedules an activity
+/// (`validateAndNormalizeTimeouts`), so that tasks for optimistic activities look like the ones
+/// the server dispatches. Lang SDKs rely on that, ex: TypeScript requires a schedule-to-close
+/// timeout on every task. Zero means no timeout.
+struct ActivityTimeouts {
+    schedule_to_close: prost_types::Duration,
+    start_to_close: prost_types::Duration,
+    heartbeat: prost_types::Duration,
+}
+
+impl ActivityTimeouts {
+    fn normalized(attrs: &ScheduleActivityTaskCommandAttributes, run_timeout: Duration) -> Self {
+        let get = |d: Option<prost_types::Duration>| {
+            d.and_then(|d| Duration::try_from(d).ok())
+                .unwrap_or_default()
+        };
+        let mut schedule_to_close = get(attrs.schedule_to_close_timeout);
+        let mut start_to_close = get(attrs.start_to_close_timeout);
+        let mut heartbeat = get(attrs.heartbeat_timeout);
+        if !schedule_to_close.is_zero() {
+            start_to_close = if start_to_close.is_zero() {
+                schedule_to_close
+            } else {
+                start_to_close.min(schedule_to_close)
+            };
+        } else {
+            schedule_to_close = run_timeout;
+        }
+        if !run_timeout.is_zero() {
+            schedule_to_close = schedule_to_close.min(run_timeout);
+            start_to_close = start_to_close.min(run_timeout);
+            heartbeat = heartbeat.min(run_timeout);
+        }
+        heartbeat = heartbeat.min(start_to_close);
+        let proto = |d: Duration| d.try_into().unwrap_or_default();
+        Self {
+            schedule_to_close: proto(schedule_to_close),
+            start_to_close: proto(start_to_close),
+            heartbeat: proto(heartbeat),
         }
     }
 }
