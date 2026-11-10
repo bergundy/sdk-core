@@ -228,7 +228,11 @@ fn describe(e: &HistoryEvent) -> String {
     let ty = format!("{:?}", e.event_type());
     match e.attributes.as_ref().unwrap() {
         Attributes::ActivityTaskScheduledEventAttributes(a) => {
-            format!("{ty} {}{}", a.activity_id, flag(a.optimistic_start))
+            format!(
+                "{ty} {}{}",
+                a.activity_id,
+                flag(a.optimistic_start.is_some())
+            )
         }
         Attributes::ActivityTaskStartedEventAttributes(a) => {
             format!(
@@ -243,7 +247,7 @@ fn describe(e: &HistoryEvent) -> String {
             flag(a.optimistic_resolution.is_some())
         ),
         Attributes::TimerStartedEventAttributes(a) => {
-            format!("{ty} {}{}", a.timer_id, flag(a.optimistic_start))
+            format!("{ty} {}{}", a.timer_id, flag(a.optimistic_start.is_some()))
         }
         Attributes::TimerFiredEventAttributes(a) => format!(
             "{ty} {}{}",
