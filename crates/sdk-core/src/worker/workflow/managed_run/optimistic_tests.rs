@@ -23,8 +23,8 @@ use temporalio_common::protos::{
         enums::v1::EventType,
         history::v1::{
             ActivityTaskCompletedEventAttributes, ActivityTaskScheduledEventAttributes,
-            ActivityTaskStartedEventAttributes, OptimisticResolution, TimerFiredEventAttributes,
-            TimerStartedEventAttributes,
+            ActivityTaskStartedEventAttributes, OptimisticResolution, OptimisticStartInfo,
+            TimerFiredEventAttributes, TimerStartedEventAttributes,
         },
     },
 };
@@ -104,7 +104,9 @@ impl OptimisticHistoryExt for TestHistoryBuilder {
             activity_type: Some(ActivityType {
                 name: DEFAULT_ACTIVITY_TYPE.to_owned(),
             }),
-            optimistic_start: true,
+            optimistic_start: Some(OptimisticStartInfo {
+                start_time: Some(SystemTime::now().into()),
+            }),
             ..Default::default()
         })
     }
@@ -135,7 +137,9 @@ impl OptimisticHistoryExt for TestHistoryBuilder {
         self.add(TimerStartedEventAttributes {
             timer_id: seq.to_string(),
             start_to_fire_timeout: Some(Duration::from_secs(3).try_into().unwrap()),
-            optimistic_start: true,
+            optimistic_start: Some(OptimisticStartInfo {
+                start_time: Some(SystemTime::now().into()),
+            }),
             ..Default::default()
         })
     }
