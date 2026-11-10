@@ -34,6 +34,7 @@ use crate::{
             LegacyQueryResult, REQUEST_TOO_LARGE_KEY, WorkerClient, WorkflowTaskCompletion,
             payload_limit_violation_from,
         },
+        optimistic_activities::OptimisticActivities,
         workflow::{
             history_update::HistoryPaginator,
             machines::MachineError,
@@ -148,6 +149,7 @@ pub(crate) struct Workflows {
     default_versioning_behavior: Option<VersioningBehavior>,
     namespace_capabilities: Arc<NamespaceCapabilities>,
     shutdown_token: CancellationToken,
+    optimistic_activities: Option<Arc<OptimisticActivities>>,
 }
 
 pub(crate) struct WorkflowBasics {
@@ -159,6 +161,9 @@ pub(crate) struct WorkflowBasics {
     pub(crate) sdk_name: String,
     pub(crate) sdk_version: String,
     pub(crate) default_versioning_behavior: Option<VersioningBehavior>,
+    pub(crate) optimistic_activities: Option<Arc<OptimisticActivities>>,
+    /// Filled in by [Workflows::new]
+    pub(crate) optimistic_env: Option<Arc<dyn optimistic::OptimisticEnv>>,
 }
 
 pub(crate) struct RunBasics<'a> {
@@ -177,7 +182,7 @@ pub(crate) struct RunBasics<'a> {
 impl Workflows {
     #[allow(clippy::too_many_arguments)] // Not much worth combining here
     pub(super) fn new(
-        basics: WorkflowBasics,
+        mut basics: WorkflowBasics,
         sticky_attrs: Option<StickyExecutionAttributes>,
         client: Arc<dyn WorkerClient>,
         wft_semaphore: MeteredPermitDealer<WorkflowSlotKind>,
@@ -190,6 +195,23 @@ impl Workflows {
     ) -> Self {
         let (local_tx, local_rx) = unbounded_channel();
         let (fetch_tx, fetch_rx) = unbounded_channel();
+        let optimistic_activities = basics.optimistic_activities.clone();
+        if let Some(registry) = optimistic_activities.as_ref() {
+            let forward_tx: UnboundedSender<LocalInput> = local_tx.clone();
+            registry.set_forwarder(move |run_id, res| {
+                let _ = forward_tx.send(LocalInput {
+                    input: LocalResolutionMsg { run_id, res }.into(),
+                    span: Span::current(),
+                });
+            });
+            basics.optimistic_env = Some(Arc::new(optimistic::OptimisticRuntime::new(
+                basics.namespace_capabilities.clone(),
+                activity_tasks_handle.clone(),
+                registry.clone(),
+                local_tx.clone(),
+                basics.worker_config.optimistic_start_payload_budget,
+            )));
+        }
         let shutdown_tok = basics.shutdown_token.clone();
         let task_queue = basics.worker_config.task_queue.clone();
         let max_eager_activity_reservations_per_workflow_task = basics
@@ -295,6 +317,7 @@ impl Workflows {
             default_versioning_behavior,
             namespace_capabilities,
             shutdown_token,
+            optimistic_activities,
         }
     }
 
@@ -389,6 +412,9 @@ impl Workflows {
             } => {
                 let reserved_act_permits =
                     self.reserve_activity_slots_for_outgoing_commands(commands.as_mut_slice());
+                if let Some(registry) = self.optimistic_activities.as_ref() {
+                    attach_optimistic_heartbeat_details(registry, run_id, &mut commands);
+                }
                 debug!(commands=%commands.display(), query_responses=%query_responses.display(),
                        messages=%messages.display(), force_new_wft,
                        "Sending responses to server");
@@ -446,6 +472,9 @@ impl Workflows {
                             if response.reset_history_event_id > 0 {
                                 reset_last_started_to = Some(response.reset_history_event_id);
                             }
+                            if let Some(registry) = self.optimistic_activities.as_ref() {
+                                registry.handoff(run_id, &response.optimistic_activity_tasks);
+                            }
                             if let Some(wft) = response.workflow_task {
                                 *wft_from_complete = Some(validate_wft(wft)?);
                             }
@@ -455,6 +484,11 @@ impl Workflows {
                             );
                         }
                         Err(e) => {
+                            // A rejected batch is never resent, so whatever its optimistic
+                            // activities do no longer matters.
+                            if let Some(registry) = self.optimistic_activities.as_ref() {
+                                registry.drop_run(run_id);
+                            }
                             let cause_and_failure =
                                 if e.metadata().contains_key(REQUEST_TOO_LARGE_KEY) {
                                     // Completion exceeds the namespace's recombined size limit, so the
@@ -1209,6 +1243,23 @@ impl EvictionRequestResult {
     }
 }
 
+/// Optimistic activities still running at a checkpoint carry their latest heartbeat details to
+/// the server.
+fn attach_optimistic_heartbeat_details(
+    registry: &OptimisticActivities,
+    run_id: &str,
+    commands: &mut [Command],
+) {
+    for cmd in commands {
+        if let Some(Attributes::ScheduleActivityTaskCommandAttributes(attrs)) =
+            cmd.attributes.as_mut()
+            && let Some(os) = attrs.optimistic_start.as_mut()
+        {
+            os.heartbeat_details = registry.heartbeat_details(run_id, &attrs.activity_id);
+        }
+    }
+}
+
 #[allow(clippy::type_complexity)]
 fn detect_terminal_command(
     commands: &[ProtoCommand],
@@ -1461,6 +1512,10 @@ fn validate_completion(
                 commands,
                 used_flags: success.used_internal_flags,
                 versioning_behavior: success.versioning_behavior.try_into().unwrap_or_default(),
+                speculative_blocks: SpeculativeBlocks {
+                    exited: success.speculative_block_exited,
+                    active: success.speculative_block_active,
+                },
             })
         }
         Some(workflow_activation_completion::Status::Failed(failure)) => {
@@ -1485,12 +1540,22 @@ enum ValidatedCompletion {
         commands: Vec<WFCommand>,
         used_flags: Vec<u32>,
         versioning_behavior: VersioningBehavior,
+        speculative_blocks: SpeculativeBlocks,
     },
     Fail {
         run_id: String,
         failure: Failure,
         is_autocomplete: bool,
     },
+}
+
+/// Speculative block state lang reports with an activation completion.
+#[derive(Debug, Default, Clone, Copy)]
+struct SpeculativeBlocks {
+    /// A speculative block exited during the activation
+    exited: bool,
+    /// At least one speculative block is active at the end of the activation
+    active: bool,
 }
 
 impl ValidatedCompletion {

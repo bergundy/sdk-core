@@ -2,6 +2,7 @@ mod activities;
 pub(crate) mod client;
 pub(crate) mod heartbeat;
 mod nexus;
+pub(crate) mod optimistic_activities;
 mod slot_provider;
 pub(crate) mod tuner;
 mod workflow;
@@ -38,6 +39,7 @@ pub(crate) use activities::{
     ExecutingLAId, LocalActRequest, LocalActivityExecutionResult, LocalActivityResolution,
     NewLocalAct,
 };
+use optimistic_activities::OptimisticActivities;
 
 #[allow(unreachable_pub)] // re-exported in test_help::integ_helpers
 pub use workflow::LEGACY_QUERY_ID;
@@ -1078,6 +1080,7 @@ impl Worker {
                         "Temporal Server 1.16.0 or newer is required to guarantee that the latest heartbeat details are preserved when an activity fails; the server did not advertise the activity_failure_include_heartbeat capability, so heartbeat details may be lost on failure"
                     );
                 }
+                let optimistic_activities = OptimisticActivities::new();
                 let at_task_mgr = act_poller.map(|ap| {
                     WorkerActivityTasks::new(
                         act_slots.clone(),
@@ -1088,11 +1091,13 @@ impl Worker {
                         config.default_heartbeat_throttle_interval,
                         config.graceful_shutdown_period,
                         config.local_timeout_buffer_for_activities,
+                        optimistic_activities.clone(),
                     )
                 });
 
                 if let Some(mgr) = &at_task_mgr {
                     let _ = cancel_activity_slot.set(mgr.cancel_activity_callback());
+                    optimistic_activities.set_cancel_callback(mgr.cancel_activity_callback());
                 }
 
                 let nexus_mgr = nexus_poller.map(|poller| {
@@ -1117,6 +1122,8 @@ impl Worker {
                             default_versioning_behavior: config
                                 .versioning_strategy
                                 .default_versioning_behavior(),
+                            optimistic_activities: Some(optimistic_activities),
+                            optimistic_env: None,
                         },
                         sticky_queue_name.map(|sq| StickyExecutionAttributes {
                             worker_task_queue: Some(TaskQueue {

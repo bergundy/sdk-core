@@ -21,6 +21,7 @@ use crate::{
         ActivitySlotKind, PollError,
         activities::activity_heartbeat_manager::ActivityHeartbeatError,
         client::{WorkerClient, payload_limit_violation_from},
+        optimistic_activities::{Fate, HeartbeatRoute, OptimisticActivities},
     },
 };
 use activity_heartbeat_manager::ActivityHeartbeatManager;
@@ -193,6 +194,8 @@ pub(crate) struct WorkerActivityTasks {
     poll_returned_shutdown_token: CancellationToken,
     /// Used to inject external cancellations (e.g. from nexus worker commands)
     cancels_tx: UnboundedSender<PendingActivityCancel>,
+    /// Activities started optimistically by workflows on this worker
+    optimistic: Arc<OptimisticActivities>,
 }
 
 #[derive(derive_more::From)]
@@ -212,6 +215,7 @@ impl WorkerActivityTasks {
         default_heartbeat_throttle_interval: Duration,
         graceful_shutdown: Option<Duration>,
         local_timeout_buffer: Duration,
+        optimistic: Arc<OptimisticActivities>,
     ) -> Self {
         let shutdown_initiated_token = CancellationToken::new();
         let outstanding_activity_tasks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
@@ -247,6 +251,7 @@ impl WorkerActivityTasks {
             local_timeout_buffer,
             shutdown_initiated_token: shutdown_initiated_token.clone(),
             metrics: metrics.clone(),
+            optimistic: optimistic.clone(),
         }
         .streamify();
 
@@ -264,6 +269,7 @@ impl WorkerActivityTasks {
             outstanding_activity_tasks,
             completers_lock: Default::default(),
             cancels_tx: external_cancels_tx,
+            optimistic,
         }
     }
 
@@ -351,10 +357,34 @@ impl WorkerActivityTasks {
         // cancelled or panics mid-completion.
         let _completion_guard =
             ActiveCounter::<fn(usize)>::new(self.completions_in_flight.clone(), None);
+        // Optimistic activities are reported with the token the server assigned at handoff, and
+        // not at all if the workflow already observed the outcome.
+        let optimistic_token = task_token
+            .is_optimistic_activity_task()
+            .then(|| task_token.clone());
+        let (task_token, status) = if let Some(token) = optimistic_token.as_ref() {
+            match self.settle_optimistic(token, status).await {
+                Some(handed_off) => handed_off,
+                None => {
+                    if let Some(act_info) = self.outstanding_activity_tasks.lock().remove(token)
+                        && let Some(jh) = act_info.local_timeouts_task
+                    {
+                        jh.abort();
+                    }
+                    self.optimistic.remove(token);
+                    return;
+                }
+            }
+        } else {
+            (task_token, status)
+        };
         let act_info = {
             let mut outstanding_activity_tasks = self.outstanding_activity_tasks.lock();
-            outstanding_activity_tasks.remove(&task_token)
+            outstanding_activity_tasks.remove(optimistic_token.as_ref().unwrap_or(&task_token))
         };
+        if let Some(token) = optimistic_token.as_ref() {
+            self.optimistic.remove(token);
+        }
         if let Some(act_info) = act_info {
             let act_metrics = self.metrics.with_new_attrs([
                 activity_type(act_info.base.activity_type),
@@ -568,21 +598,60 @@ impl WorkerActivityTasks {
         }
     }
 
+    /// Waits until the fate of an optimistic activity's outcome is known. Returns the token to
+    /// report the outcome with, if it must be reported to the server.
+    async fn settle_optimistic(
+        &self,
+        token: &TaskToken,
+        status: aer::Status,
+    ) -> Option<(TaskToken, aer::Status)> {
+        let status = match status {
+            aer::Status::WillCompleteAsync(_) => {
+                warn!(task_token = %token,
+                      "Optimistically started activities can't complete asynchronously, \
+                       failing the attempt");
+                aer::Status::Failed(ar::Failure {
+                    failure: Some(async_completion_unsupported_failure()),
+                    ..Default::default()
+                })
+            }
+            s => s,
+        };
+        let mut fate = self.optimistic.subscribe(token)?;
+        if *fate.borrow() == Fate::InWindow {
+            self.optimistic.forward_outcome(token, status.clone());
+        }
+        let fate = fate.wait_for(|f| *f != Fate::InWindow).await.ok()?.clone();
+        match fate {
+            Fate::HandedOff(real) => Some((real, status)),
+            _ => None,
+        }
+    }
+
     /// Attempt to record an activity heartbeat
     pub(crate) fn record_heartbeat(
         &self,
-        details: ActivityHeartbeat,
+        mut details: ActivityHeartbeat,
     ) -> Result<(), ActivityHeartbeatError> {
         // TODO: Propagate these back as cancels. Silent fails is too nonobvious
+        let task_token: TaskToken = details.task_token.clone().into();
         let (heartbeat_timeout, timeout_resetter) = {
             let mut outstanding_activity_tasks = self.outstanding_activity_tasks.lock();
-            let task_token: TaskToken = details.task_token.clone().into();
             let at_info = outstanding_activity_tasks
                 .get_mut(&task_token)
                 .ok_or(ActivityHeartbeatError::UnknownActivity)?;
             at_info.last_heartbeat_details = Some(details.details.clone());
             (at_info.heartbeat_timeout, at_info.timeout_resetter.clone())
         };
+        if task_token.is_optimistic_activity_task() {
+            match self
+                .optimistic
+                .route_heartbeat(&task_token, &details.details)
+            {
+                HeartbeatRoute::Hold | HeartbeatRoute::Discard => return Ok(()),
+                HeartbeatRoute::Forward(real) => details.task_token = real.into_inner(),
+            }
+        }
         let heartbeat_timeout: Duration = heartbeat_timeout
             // We treat None as 0 (even though heartbeat_timeout is never set to None by the server)
             .unwrap_or_default()
@@ -652,6 +721,7 @@ struct ActivityTaskStream<SrcStrm> {
     /// Token which is cancelled once shutdown is beginning
     shutdown_initiated_token: CancellationToken,
     metrics: MetricsContext,
+    optimistic: Arc<OptimisticActivities>,
 }
 
 impl<SrcStrm> ActivityTaskStream<SrcStrm>
@@ -670,7 +740,15 @@ where
         self.source_stream
             .filter_map(move |source| {
                 let res = match source {
-                    ActivityTaskSource::PendingCancel(next_pc) => {
+                    ActivityTaskSource::PendingCancel(mut next_pc) => {
+                        // Cancels learned from the server for handed off optimistic activities
+                        // name them by the server's token, but lang only knows the made up one.
+                        if !next_pc.task_token.is_optimistic_activity_task()
+                            && let Some(synthetic) =
+                                self.optimistic.synthetic_for(&next_pc.task_token)
+                        {
+                            next_pc.task_token = synthetic;
+                        }
                         // It's possible that activity has been completed and we no longer have
                         // an outstanding activity task. This is fine because it means that we
                         // no longer need to cancel this activity, so we'll just ignore such
@@ -737,6 +815,19 @@ where
                                 ),
                             );
 
+                            // The window of an optimistic activity may be discarded before lang
+                            // receives it, in which case the cancel couldn't be issued earlier.
+                            if tt.is_optimistic_activity_task() && self.optimistic.is_dropped(&tt)
+                            {
+                                let _ = cancels_tx.send(PendingActivityCancel::new(
+                                    tt.clone(),
+                                    ActivityCancelReason::Cancelled,
+                                    ActivityCancellationDetails {
+                                        is_cancelled: true,
+                                        ..Default::default()
+                                    },
+                                ));
+                            }
                             // If we have already waited the grace period and issued cancels,
                             // this will have been set true, indicating anything that happened
                             // to be buffered/in-flight/etc should get an immediate cancel. This
@@ -750,12 +841,14 @@ where
                                         ActivityCancelReason::WorkerShutdown,
                                     ),
                                 ));
-                            } else {
+                            } else if !tt.is_optimistic_activity_task() {
                                 // Fire off task to keep track of local timeouts. We do this so that
                                 // activities can still get cleaned up even if the user isn't
                                 // heartbeating. Schedule to closed is not tracked due to the
                                 // possibility of clock skew messing things up, and it's relative
-                                // unlikeliness compared to the other timeouts.
+                                // unlikeliness compared to the other timeouts. Optimistic
+                                // activities are handed off by their deadlines instead, and
+                                // their heartbeat timeout only counts from the handoff.
                                 if let Some(timers) = ActivityLocalTimers::new(
                                     task.resp.heartbeat_timeout,
                                     task.resp.start_to_close_timeout,
@@ -853,6 +946,7 @@ where
 
 /// Provides facilities for the workflow side of things to interact with the activity manager.
 /// Allows for the handling of activities returned by WFT completions.
+#[derive(Clone)]
 pub(crate) struct ActivitiesFromWFTsHandle {
     sem: Arc<ClosableMeteredPermitDealer<ActivitySlotKind>>,
     tx: UnboundedSender<TrackedPermittedTqResp<PollActivityTaskQueueResponse>>,
@@ -877,6 +971,22 @@ impl ActivitiesFromWFTsHandle {
             // and time insensitivity, that metric is tracked in `about_to_issue_task`.
             self.tx.send(t).expect("Receive half cannot be dropped");
         }
+    }
+}
+
+fn async_completion_unsupported_failure() -> Failure {
+    Failure {
+        message: "Activities started optimistically inside a speculative block can't complete \
+                  asynchronously. Retries are scheduled normally and may complete asynchronously."
+            .to_string(),
+        failure_info: Some(FailureInfo::ApplicationFailureInfo(
+            ApplicationFailureInfo {
+                r#type: "OptimisticAsyncCompletionUnsupported".to_string(),
+                non_retryable: false,
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
     }
 }
 
@@ -1068,6 +1178,7 @@ mod tests {
             Duration::from_secs(1),
             None,
             local_timeout_buffer,
+            OptimisticActivities::new(),
         )
     }
 
@@ -1155,6 +1266,7 @@ mod tests {
             Duration::from_secs(1),
             None,
             Duration::from_secs(5),
+            OptimisticActivities::new(),
         );
         let start = Instant::now();
         let t1 = atm.poll().await.unwrap();

@@ -5,6 +5,7 @@ use std::{
 };
 
 static LOCAL_ACT_TASK_TOKEN_PREFIX: &[u8] = b"local_act_";
+static OPTIMISTIC_ACT_TASK_TOKEN_PREFIX: &[u8] = b"optimistic_act_";
 
 #[derive(
     Hash,
@@ -36,6 +37,20 @@ impl TaskToken {
     /// Returns true if the task token is for a local activity
     pub fn is_local_activity_task(&self) -> bool {
         self.0.starts_with(LOCAL_ACT_TASK_TOKEN_PREFIX)
+    }
+
+    /// Activities started optimistically, before the server knows about them, get tokens made up
+    /// by the worker until they are handed off to the server. Such tokens are always prefixed
+    /// with a special sigil so they can be identified easily.
+    pub fn new_optimistic_activity_token(unique_data: impl IntoIterator<Item = u8>) -> Self {
+        let mut bytes = OPTIMISTIC_ACT_TASK_TOKEN_PREFIX.to_vec();
+        bytes.extend(unique_data);
+        TaskToken(bytes)
+    }
+
+    /// Returns true if the task token was made up for an optimistically started activity
+    pub fn is_optimistic_activity_task(&self) -> bool {
+        self.0.starts_with(OPTIMISTIC_ACT_TASK_TOKEN_PREFIX)
     }
 }
 
