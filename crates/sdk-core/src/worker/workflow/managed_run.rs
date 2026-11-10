@@ -1765,6 +1765,9 @@ fn sorted(names: &[String]) -> Vec<String> {
 }
 
 #[cfg(test)]
+mod optimistic_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
         TaskStorageMetrics, log_workflow_task_duration, parse_wft_duration_warn_threshold,
@@ -2188,6 +2191,7 @@ mod tests {
         fn manager(history: &TestHistoryBuilder) -> WorkflowManager {
             WorkflowManager::new(RunBasics {
                 worker_config: test_worker_cfg().build().unwrap().into(),
+                optimistic_env: None,
                 workflow_id: "fanout".to_owned(),
                 workflow_type: DEFAULT_WORKFLOW_TYPE.to_owned(),
                 run_id: history.get_orig_run_id().to_owned(),

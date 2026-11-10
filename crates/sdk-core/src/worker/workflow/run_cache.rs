@@ -70,6 +70,7 @@ impl RunCache {
         let (mrh, rur) = ManagedRun::new(
             RunBasics {
                 worker_config: self.worker_config.clone(),
+                optimistic_env: None,
                 workflow_id: pwft.work.execution.workflow_id.clone(),
                 workflow_type: pwft.work.workflow_type.clone(),
                 run_id: run_id.clone(),

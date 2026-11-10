@@ -215,6 +215,13 @@ pub struct WorkerConfig {
     #[builder(default = 3)]
     pub max_eager_activity_reservations_per_workflow_task: usize,
 
+    /// Maximum total size, in bytes, of the payloads (activity inputs and observed results) that
+    /// a speculation window may accumulate in its optimistic log. Once a window would exceed it,
+    /// Core checkpoints the window, and outcomes that didn't fit are reported to the server
+    /// separately. Defaults to 2 MiB.
+    #[builder(default = 2 * 1024 * 1024)]
+    pub optimistic_start_payload_budget: usize,
+
     /// If set false (default), shutdown will not finish until all pending evictions have been
     /// issued and replied to. If set true shutdown will be considered complete when the only
     /// remaining work is pending evictions.
@@ -532,6 +539,13 @@ impl NamespaceCapabilities {
     pub fn workflow_task_completion_pagination(&self) -> bool {
         self.capabilities()
             .is_some_and(|capabilities| capabilities.workflow_task_completion_pagination)
+    }
+
+    /// Returns true if the namespace accepts optimistically started activities and timers, which
+    /// workflows request with speculative blocks.
+    pub fn optimistic_start(&self) -> bool {
+        self.capabilities()
+            .is_some_and(|capabilities| capabilities.optimistic_start)
     }
 
     /// The namespace's limit on the recombined size of a paginated workflow task completion, if one

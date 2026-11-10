@@ -33,6 +33,12 @@ fsm! {
     StartCommandCreated --(CommandStartTimer) --> StartCommandCreated;
     StartCommandCreated --(TimerStarted(HistoryEventId), on_timer_started) --> StartCommandRecorded;
     StartCommandCreated --(Cancel, shared on_cancel) --> Canceled;
+    // An optimistically started timer already is in the command list sent at the checkpoint, and
+    // later commands' event ids depend on it, so cancelling it must not remove the command.
+    StartCommandCreated --(OptimisticCancel, shared on_optimistic_cancel)
+      --> OptimisticCancelCommandCreated;
+    OptimisticCancelCommandCreated --(CommandCancelTimer) --> OptimisticCancelCommandSent;
+    OptimisticCancelCommandSent --(TimerStarted(HistoryEventId)) --> CancelTimerCommandSent;
 
     StartCommandRecorded --(TimerFired(TimerFiredEventAttributes), shared on_timer_fired) --> Fired;
     StartCommandRecorded --(Cancel, shared on_cancel) --> CancelTimerCommandCreated;
@@ -46,6 +52,9 @@ fsm! {
     // Ignore any spurious cancellations after resolution
     Canceled --(Cancel) --> Canceled;
     Fired --(Cancel) --> Fired;
+    OptimisticCancelCommandCreated --(Cancel) --> OptimisticCancelCommandCreated;
+    OptimisticCancelCommandSent --(Cancel) --> OptimisticCancelCommandSent;
+    CancelTimerCommandSent --(Cancel) --> CancelTimerCommandSent;
 }
 
 #[derive(Debug, derive_more::Display)]
@@ -62,6 +71,11 @@ pub(super) struct SharedState {
     attrs: StartTimer,
     cancelled_before_sent: bool,
     annotations: CommandAnnotations,
+    /// Set if the timer was started optimistically inside a speculation window.
+    optimistic: bool,
+    /// Set once the workflow observed the optimistic timer firing before the event recording it
+    /// was applied.
+    resolved_optimistically: bool,
 }
 
 /// Creates a new, scheduled, timer as a [CancellableCommand]
@@ -96,6 +110,8 @@ impl TimerMachine {
                 attrs: attribs,
                 cancelled_before_sent: false,
                 annotations,
+                optimistic: false,
+                resolved_optimistically: false,
             },
         )
     }
@@ -105,22 +121,77 @@ impl TimerMachine {
         annotations: CommandAnnotations,
     ) -> Result<Vec<MachineResponse>, MachineError<WFMachinesError>> {
         self.shared_state.annotations.override_with(annotations);
-        Ok(
-            match OnEventWrapper::on_event_mut(self, TimerMachineEvents::Cancel)?.pop() {
-                Some(TimerMachineCommand::IssueCancelCmd(cmd)) => {
-                    vec![MachineResponse::IssueNewCommand(Command::new(
-                        cmd,
-                        self.shared_state.annotations.clone(),
-                    ))]
-                }
-                None => vec![],
-                x => panic!("Invalid cancel event response {x:?}"),
-            },
-        )
+        if self.shared_state.resolved_optimistically {
+            return Ok(vec![]);
+        }
+        let event = if self.shared_state.optimistic
+            && matches!(self.state(), TimerMachineState::StartCommandCreated(_))
+        {
+            TimerMachineEvents::OptimisticCancel
+        } else {
+            TimerMachineEvents::Cancel
+        };
+        Ok(match OnEventWrapper::on_event_mut(self, event)?.pop() {
+            Some(TimerMachineCommand::IssueCancelCmd(cmd)) => {
+                vec![MachineResponse::IssueNewCommand(Command::new(
+                    cmd,
+                    self.shared_state.annotations.clone(),
+                ))]
+            }
+            None => vec![],
+            x => panic!("Invalid cancel event response {x:?}"),
+        })
     }
 
     pub(super) fn was_cancelled_before_sent_to_server(&self) -> bool {
         self.shared_state().cancelled_before_sent
+    }
+
+    pub(super) fn seq(&self) -> u32 {
+        self.shared_state.attrs.seq
+    }
+
+    pub(super) fn attrs(&self) -> &StartTimer {
+        &self.shared_state.attrs
+    }
+
+    pub(super) fn set_optimistic(&mut self) {
+        self.shared_state.optimistic = true;
+    }
+
+    pub(super) fn is_optimistic(&self) -> bool {
+        self.shared_state.optimistic
+    }
+
+    pub(super) fn resolved_optimistically(&self) -> bool {
+        self.shared_state.resolved_optimistically
+    }
+
+    /// True while the workflow may still observe this optimistic timer firing during the current
+    /// workflow task.
+    pub(super) fn awaiting_optimistic_fire(&self) -> bool {
+        self.shared_state.optimistic
+            && !self.shared_state.resolved_optimistically
+            && matches!(self.state(), TimerMachineState::StartCommandCreated(_))
+    }
+
+    /// Fires the timer for the workflow during the workflow task that started it. The event
+    /// recording the firing is applied later without producing a job.
+    pub(super) fn fire_optimistically(&mut self) -> Result<Vec<MachineResponse>, WFMachinesError> {
+        if !self.awaiting_optimistic_fire() {
+            return Err(fatal!(
+                "Timer (seq {}) can't be fired optimistically in state {}",
+                self.shared_state.attrs.seq,
+                self.state()
+            ));
+        }
+        self.shared_state.resolved_optimistically = true;
+        Ok(vec![
+            FireTimer {
+                seq: self.shared_state.attrs.seq,
+            }
+            .into(),
+        ])
     }
 }
 
@@ -198,7 +269,37 @@ pub(super) struct Fired {}
 #[derive(Default, Clone)]
 pub(super) struct StartCommandCreated {}
 
+#[derive(Default, Clone)]
+pub(super) struct OptimisticCancelCommandCreated {}
+
+#[derive(Default, Clone)]
+pub(super) struct OptimisticCancelCommandSent {}
+
+impl From<OptimisticCancelCommandCreated> for OptimisticCancelCommandSent {
+    fn from(_: OptimisticCancelCommandCreated) -> Self {
+        Self::default()
+    }
+}
+
+impl From<OptimisticCancelCommandSent> for CancelTimerCommandSent {
+    fn from(_: OptimisticCancelCommandSent) -> Self {
+        Self::default()
+    }
+}
+
 impl StartCommandCreated {
+    pub(super) fn on_optimistic_cancel(
+        self,
+        dat: &mut SharedState,
+    ) -> TimerMachineTransition<OptimisticCancelCommandCreated> {
+        TransitionResult::ok(
+            vec![TimerMachineCommand::IssueCancelCmd(
+                CancelTimer { seq: dat.attrs.seq }.into(),
+            )],
+            OptimisticCancelCommandCreated::default(),
+        )
+    }
+
     pub(super) fn on_timer_started(
         self,
         _id: HistoryEventId,
