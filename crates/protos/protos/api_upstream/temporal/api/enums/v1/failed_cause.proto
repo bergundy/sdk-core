@@ -90,6 +90,12 @@ enum WorkflowTaskFailedCause {
     WORKFLOW_TASK_FAILED_CAUSE_WORKFLOW_PAUSE_REQUESTED_BEFORE_TASK_STARTED = 39;
     // A workflow task failed because the request exceeded a size limit.
     WORKFLOW_TASK_FAILED_CAUSE_REQUEST_TOO_LARGE = 40;
+    // A workflow task failed because a `ResolveOptimisticActivity` command was invalid, for example
+    // because it didn't reference an activity started optimistically earlier in the same task.
+    WORKFLOW_TASK_FAILED_CAUSE_BAD_RESOLVE_OPTIMISTIC_ACTIVITY_ATTRIBUTES = 41;
+    // A workflow task failed because a `FireOptimisticTimer` command was invalid, for example
+    // because it didn't reference a timer started optimistically earlier in the same task.
+    WORKFLOW_TASK_FAILED_CAUSE_BAD_FIRE_OPTIMISTIC_TIMER_ATTRIBUTES = 42;
 }
 
 // Activity tasks can fail for various reasons. Note that some of these reasons can only originate

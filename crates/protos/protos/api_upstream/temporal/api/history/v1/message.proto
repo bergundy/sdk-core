@@ -420,6 +420,15 @@ message WorkflowTaskFailedEventAttributes {
     temporal.api.common.v1.WorkerVersionStamp worker_version = 10 [deprecated = true];
 }
 
+// Set on resolution events written from `ResolveOptimisticActivity` and `FireOptimisticTimer`
+// commands. The workflow already observed these outcomes during the workflow task that recorded
+// them, so SDKs apply them within that workflow task when replaying, not after the next one.
+message OptimisticResolution {
+    // The workflow task's started event time plus the offset reported by the worker. SDKs set
+    // workflow time to this value when applying the event.
+    google.protobuf.Timestamp workflow_time = 1;
+}
+
 message ActivityTaskScheduledEventAttributes {
     // The worker/user assigned identifier for the activity
     string activity_id = 1;
@@ -465,6 +474,9 @@ message ActivityTaskScheduledEventAttributes {
     // Priority metadata. If this message is not present, or any fields are not
     // present, they inherit the values from the workflow.
     temporal.api.common.v1.Priority priority = 14;
+    // True if the worker started this activity optimistically, inside a speculation window,
+    // before the server knew about it.
+    bool optimistic_start = 15;
 }
 
 message ActivityTaskStartedEventAttributes {
@@ -491,6 +503,10 @@ message ActivityTaskStartedEventAttributes {
     // when rebuilding it from events.
     // Deprecated. This field should be cleaned up when versioning-2 API is removed. [cleanup-experimental-wv]
     int64 build_id_redirect_counter = 7 [deprecated = true];
+    // True if this event was written together with an optimistic resolution, from a
+    // `ResolveOptimisticActivity` command. SDKs use this to classify the event as produced by the
+    // worker, without looking at the following event.
+    bool optimistic_resolution = 8;
 }
 
 message ActivityTaskCompletedEventAttributes {
@@ -505,6 +521,9 @@ message ActivityTaskCompletedEventAttributes {
     // Version info of the worker who processed this workflow task.
     // Deprecated. This field should be cleaned up when versioning-2 API is removed. [cleanup-experimental-wv]
     temporal.api.common.v1.WorkerVersionStamp worker_version = 5 [deprecated = true];
+    // Set if the workflow already observed this outcome during the workflow task that recorded
+    // it (written from a `ResolveOptimisticActivity` command).
+    OptimisticResolution optimistic_resolution = 6;
 }
 
 message ActivityTaskFailedEventAttributes {
@@ -557,6 +576,9 @@ message ActivityTaskCanceledEventAttributes {
     // Version info of the worker who processed this workflow task.
     // Deprecated. This field should be cleaned up when versioning-2 API is removed. [cleanup-experimental-wv]
     temporal.api.common.v1.WorkerVersionStamp worker_version = 6 [deprecated = true];
+    // Set if the workflow already observed this outcome during the workflow task that recorded
+    // it (written from a `ResolveOptimisticActivity` command).
+    OptimisticResolution optimistic_resolution = 7;
 }
 
 message TimerStartedEventAttributes {
@@ -569,6 +591,9 @@ message TimerStartedEventAttributes {
     google.protobuf.Duration start_to_fire_timeout = 2;
     // The `WORKFLOW_TASK_COMPLETED` event which this command was reported with
     int64 workflow_task_completed_event_id = 3;
+    // True if the worker started this timer optimistically, inside a speculation window, before
+    // the server knew about it.
+    bool optimistic_start = 4;
 }
 
 message TimerFiredEventAttributes {
@@ -576,6 +601,9 @@ message TimerFiredEventAttributes {
     string timer_id = 1;
     // The id of the `TIMER_STARTED` event itself
     int64 started_event_id = 2;
+    // Set if the workflow already observed this timer firing during the workflow task that
+    // recorded it (written from a `FireOptimisticTimer` command).
+    OptimisticResolution optimistic_resolution = 3;
 }
 
 message TimerCanceledEventAttributes {
