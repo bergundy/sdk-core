@@ -420,6 +420,16 @@ message WorkflowTaskFailedEventAttributes {
     temporal.api.common.v1.WorkerVersionStamp worker_version = 10 [deprecated = true];
 }
 
+// Set on `ACTIVITY_TASK_SCHEDULED` and `TIMER_STARTED` events for commands the worker started
+// optimistically, inside a speculation window, before the server knew about them.
+message OptimisticStartInfo {
+    // When the worker started the command: the workflow task's started event time plus the
+    // offset reported by the worker, capped at the time the server processed the command. Times
+    // that count from the start of the command (activity scheduled and started times, timeouts,
+    // timer expiry) use this value instead of the event time.
+    google.protobuf.Timestamp start_time = 1;
+}
+
 // Set on resolution events written from `ResolveOptimisticActivity` and `FireOptimisticTimer`
 // commands. The workflow already observed these outcomes during the workflow task that recorded
 // them, so SDKs apply them within that workflow task when replaying, not after the next one.
@@ -474,9 +484,9 @@ message ActivityTaskScheduledEventAttributes {
     // Priority metadata. If this message is not present, or any fields are not
     // present, they inherit the values from the workflow.
     temporal.api.common.v1.Priority priority = 14;
-    // True if the worker started this activity optimistically, inside a speculation window,
+    // Set if the worker started this activity optimistically, inside a speculation window,
     // before the server knew about it.
-    bool optimistic_start = 15;
+    OptimisticStartInfo optimistic_start = 15;
 }
 
 message ActivityTaskStartedEventAttributes {
@@ -591,9 +601,10 @@ message TimerStartedEventAttributes {
     google.protobuf.Duration start_to_fire_timeout = 2;
     // The `WORKFLOW_TASK_COMPLETED` event which this command was reported with
     int64 workflow_task_completed_event_id = 3;
-    // True if the worker started this timer optimistically, inside a speculation window, before
-    // the server knew about it.
-    bool optimistic_start = 4;
+    // Set if the worker started this timer optimistically, inside a speculation window, before
+    // the server knew about it. The timer expires at `optimistic_start.start_time` plus
+    // `start_to_fire_timeout`.
+    OptimisticStartInfo optimistic_start = 4;
 }
 
 message TimerFiredEventAttributes {
