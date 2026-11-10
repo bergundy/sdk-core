@@ -93,6 +93,7 @@ impl WFStream {
                 (basics.sdk_name.clone(), basics.sdk_version.clone()),
                 basics.server_capabilities,
                 local_activity_request_sink,
+                basics.optimistic_env.clone(),
                 basics.metrics.clone(),
             ),
             shutdown_token: basics.shutdown_token,
@@ -306,11 +307,13 @@ impl WFStream {
                     commands,
                     used_flags,
                     versioning_behavior,
+                    speculative_blocks,
                     ..
                 } => match rh.successful_completion(
                     commands,
                     used_flags,
                     versioning_behavior,
+                    speculative_blocks,
                     complete.response_tx,
                     false,
                 ) {
@@ -359,7 +362,11 @@ impl WFStream {
         // one was being delivered) count as not-yet-resolved too: they can schedule further LAs,
         // and the commands they produce are only flushed by the completion that finally answers
         // the WFT. Evicting first would strand those commands in the discarded machines.
-        if has_zero_sized_cache && !rh.waiting_on_local_activities() && !rh.more_pending_work() {
+        if has_zero_sized_cache
+            && !rh.waiting_on_local_activities()
+            && !rh.more_pending_work()
+            && !rh.optimistic_window_open()
+        {
             acts.extend(self.request_eviction_of_lru_run().into_run_update_resp())
         }
         acts
