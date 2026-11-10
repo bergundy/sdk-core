@@ -87,7 +87,7 @@ pub(crate) enum OptimisticResultKind {
     Activity {
         seq: u32,
         token: TaskToken,
-        status: activity_execution_result::Status,
+        status: Box<activity_execution_result::Status>,
     },
     TimerFired {
         seq: u32,

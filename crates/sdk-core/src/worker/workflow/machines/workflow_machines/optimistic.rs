@@ -680,7 +680,7 @@ impl WorkflowMachines {
         } else if self.local_activity_data.outstanding_la_count() > 0 {
             self.request_optimistic_checkpoint(CheckpointReason::LocalActivity);
         } else if self.optimistic.block_exited
-            && !(self.optimistic.block_active && !self.has_pending_non_optimistic_work())
+            && (!self.optimistic.block_active || self.has_pending_non_optimistic_work())
         {
             self.request_optimistic_checkpoint(CheckpointReason::BlockExit);
         }
@@ -722,7 +722,7 @@ impl WorkflowMachines {
                 let Machines::ActivityMachine(m) = self.machine(mk) else {
                     return Ok(false);
                 };
-                let outcome = match status {
+                let outcome = match *status {
                     activity_execution_result::Status::Completed(Success { result }) => {
                         Some(OptimisticActivityOutcome::Completed(
                             result.map(|p| Payloads { payloads: vec![p] }),
