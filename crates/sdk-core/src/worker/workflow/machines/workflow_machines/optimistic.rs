@@ -341,13 +341,13 @@ impl WorkflowMachines {
                 (
                     Some(ProtoCmdAttrs::ScheduleActivityTaskCommandAttributes(cmd)),
                     Some(history_event::Attributes::ActivityTaskScheduledEventAttributes(ev)),
-                ) if ev.optimistic_start && ev.activity_id == cmd.activity_id => {
+                ) if ev.optimistic_start.is_some() && ev.activity_id == cmd.activity_id => {
                     marks.push((c.machine, Some(predicted)));
                 }
                 (
                     Some(ProtoCmdAttrs::StartTimerCommandAttributes(cmd)),
                     Some(history_event::Attributes::TimerStartedEventAttributes(ev)),
-                ) if ev.optimistic_start && ev.timer_id == cmd.timer_id => {
+                ) if ev.optimistic_start.is_some() && ev.timer_id == cmd.timer_id => {
                     marks.push((c.machine, None));
                 }
                 _ => {}

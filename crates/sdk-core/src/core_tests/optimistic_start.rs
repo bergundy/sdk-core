@@ -678,7 +678,9 @@ async fn next_task_applies_batch_without_jobs() {
             activity_type: Some(temporalio_common::protos::temporal::api::common::v1::ActivityType {
                 name: "act".to_owned(),
             }),
-            optimistic_start: true,
+            optimistic_start: Some(
+                temporalio_common::protos::temporal::api::history::v1::OptimisticStartInfo::default(),
+            ),
             ..Default::default()
         },
     );
