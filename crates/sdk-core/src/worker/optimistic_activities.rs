@@ -146,7 +146,7 @@ impl OptimisticActivities {
                     kind: OptimisticResultKind::Activity {
                         seq,
                         token: token.clone(),
-                        status,
+                        status: Box::new(status),
                     },
                 }),
             );
