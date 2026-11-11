@@ -407,6 +407,11 @@ impl WorkerActivityTasks {
             let mut outstanding_activity_tasks = self.outstanding_activity_tasks.lock();
             outstanding_activity_tasks.remove(optimistic_token.as_ref().unwrap_or(&task_token))
         };
+        // Activities handed off by a checkpoint that closed their workflow are expected to be
+        // gone on the server by the time their outcome is reported.
+        let expect_not_found = optimistic_token
+            .as_ref()
+            .is_some_and(|t| self.optimistic.handed_off_with_closed_workflow(t));
         if let Some(token) = optimistic_token.as_ref() {
             self.optimistic.remove(token);
         }
@@ -606,7 +611,10 @@ impl WorkerActivityTasks {
                 };
 
                 if let Some(e) = maybe_net_err {
-                    if e.code() == tonic::Code::NotFound {
+                    if e.code() == tonic::Code::NotFound && expect_not_found {
+                        debug!(task_token=?task_token,
+                               "Activity of a workflow closed by its checkpoint not found on completion");
+                    } else if e.code() == tonic::Code::NotFound {
                         warn!(task_token=?task_token, details=?e, "Activity not found on \
                         completion. This may happen if the activity has already been cancelled but \
                         completed anyway.");
@@ -847,9 +855,12 @@ where
                                 ),
                             );
 
-                            // The window of an optimistic activity may be discarded before lang
-                            // receives it, in which case the cancel couldn't be issued earlier.
-                            if tt.is_optimistic_activity_task() && self.optimistic.is_dropped(&tt) {
+                            // The window of an optimistic activity may be discarded, or its
+                            // workflow closed, before lang receives it, in which case the cancel
+                            // couldn't be issued earlier.
+                            if tt.is_optimistic_activity_task()
+                                && self.optimistic.cancel_on_dispatch(&tt)
+                            {
                                 let _ = cancels_tx.send(PendingActivityCancel::new(
                                     tt.clone(),
                                     ActivityCancelReason::Cancelled,

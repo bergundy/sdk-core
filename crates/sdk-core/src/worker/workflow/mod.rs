@@ -440,6 +440,7 @@ impl Workflows {
                         0
                     };
                 let mut maybe_record_terminal_metric = detect_terminal_command(&commands);
+                let closes_workflow = maybe_record_terminal_metric.is_some();
                 let mut completion = WorkflowTaskCompletion {
                     task_token: task_token.clone(),
                     commands,
@@ -483,8 +484,11 @@ impl Workflows {
                                 reset_last_started_to = Some(response.reset_history_event_id);
                             }
                             if let Some(registry) = self.optimistic_activities.as_ref() {
-                                let handoff =
-                                    registry.handoff(run_id, &response.optimistic_activity_tasks);
+                                let handoff = registry.handoff(
+                                    run_id,
+                                    &response.optimistic_activity_tasks,
+                                    closes_workflow,
+                                );
                                 record_handoff_metrics(&run_metrics, handoff);
                             }
                             if let Some(wft) = response.workflow_task {
