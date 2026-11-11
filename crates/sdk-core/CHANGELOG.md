@@ -47,6 +47,34 @@ relevant information.
   ordinary activity and timer events. Lang reports block exits with `speculative_block_exited`
   and `speculative_block_active` on activation completions. Large batches go out as paginated
   workflow task completions when the namespace supports them.
+* Metrics for optimistic start. All carry the worker's usual `namespace`, `task_queue` and
+  `workflow_type` attributes:
+  * `optimistic_activity_started` (counter, `activity_type`): activities started optimistically.
+  * `optimistic_activity_observed` (counter, `activity_type`, `outcome` = `completed` or
+    `canceled`): outcomes the workflow observed inside their speculation window.
+  * `optimistic_activity_handed_off` (counter, `activity_type`): still running optimistic
+    activities the server took over at a checkpoint.
+  * `optimistic_activity_dropped` (counter, `activity_type`): optimistic activities whose window
+    was discarded (rejected or failed workflow task, eviction) or which the server didn't take
+    over. Their local executions are cancelled.
+  * `optimistic_timer_started` (counter): timers started optimistically.
+  * `optimistic_timer_fired` (counter): optimistic timer firings the workflow observed inside
+    their window.
+  * `optimistic_timer_cancelled` (counter): optimistic timers the workflow cancelled inside their
+    window.
+  * `optimistic_timer_handed_off` (counter): optimistic timers that became server timers at a
+    checkpoint.
+  * `optimistic_start_fallback` (counter, `fallback_reason`): speculative commands sent as normal
+    commands. A workflow task's speculative commands from one activation fall back together, all
+    counted with the reason that blocked them: `capability`, `task_queue`, `no_slot`,
+    `rate_limited`, `no_activity_worker`, `window_time`, `local_activities`,
+    `non_deferrable_batch` or `window_closing`.
+  * `speculation_window_checkpoint` (counter, `checkpoint_reason`): windows checkpointed, with
+    reason `block_exit`, `non_deferrable_command`, `ineligible_command`, `workflow_completion`,
+    `deadline` (80% of the workflow task timeout), `activity_timeout`, `activity_failed`,
+    `local_activity`, `query`, `eviction` or `idle` (nothing the workflow waits on is in flight).
+  * `speculation_window_duration` (duration histogram): how long windows stayed open, until their
+    checkpoint was sent or they were discarded.
 
 ### Security
 * Ephemeral server downloads now use `zip` 9.0 for ZIP extraction, replacing the 8.x dependency

@@ -67,6 +67,17 @@ struct Instruments {
     sticky_cache_miss: Counter,
     sticky_cache_size: Gauge,
     sticky_cache_forced_evictions: Counter,
+    optimistic_activity_started: Counter,
+    optimistic_activity_observed: Counter,
+    optimistic_activity_handed_off: Counter,
+    optimistic_activity_dropped: Counter,
+    optimistic_timer_started: Counter,
+    optimistic_timer_fired: Counter,
+    optimistic_timer_cancelled: Counter,
+    optimistic_timer_handed_off: Counter,
+    optimistic_start_fallback: Counter,
+    speculation_window_checkpoint: Counter,
+    speculation_window_duration: HistogramDuration,
 }
 
 struct HeartbeatLabel {
@@ -337,6 +348,61 @@ impl MetricsContext {
     pub(crate) fn forced_cache_eviction(&self) {
         self.instruments.sticky_cache_forced_evictions.adds(1);
     }
+
+    /// An activity started optimistically, inside a speculation window
+    pub(crate) fn optimistic_activity_started(&self) {
+        self.instruments.optimistic_activity_started.adds(1);
+    }
+
+    /// The workflow observed an optimistic activity's outcome inside its window
+    pub(crate) fn optimistic_activity_observed(&self) {
+        self.instruments.optimistic_activity_observed.adds(1);
+    }
+
+    /// The server took over still running optimistic activities at a checkpoint
+    pub(crate) fn optimistic_activity_handed_off(&self) {
+        self.instruments.optimistic_activity_handed_off.adds(1);
+    }
+
+    /// An optimistic activity's window was discarded or the server didn't take it over
+    pub(crate) fn optimistic_activity_dropped(&self) {
+        self.instruments.optimistic_activity_dropped.adds(1);
+    }
+
+    /// A timer started optimistically, inside a speculation window
+    pub(crate) fn optimistic_timer_started(&self) {
+        self.instruments.optimistic_timer_started.adds(1);
+    }
+
+    /// The workflow observed an optimistic timer firing inside its window
+    pub(crate) fn optimistic_timer_fired(&self) {
+        self.instruments.optimistic_timer_fired.adds(1);
+    }
+
+    /// The workflow cancelled an optimistic timer inside its window
+    pub(crate) fn optimistic_timer_cancelled(&self, num: u64) {
+        self.instruments.optimistic_timer_cancelled.adds(num);
+    }
+
+    /// Optimistic timers became server timers at a checkpoint
+    pub(crate) fn optimistic_timer_handed_off(&self, num: u64) {
+        self.instruments.optimistic_timer_handed_off.adds(num);
+    }
+
+    /// Speculative commands were sent as normal commands instead of starting optimistically
+    pub(crate) fn optimistic_start_fallback(&self, num: u64) {
+        self.instruments.optimistic_start_fallback.adds(num);
+    }
+
+    /// A speculation window was checkpointed
+    pub(crate) fn speculation_window_checkpoint(&self) {
+        self.instruments.speculation_window_checkpoint.adds(1);
+    }
+
+    /// How long a speculation window was open, until its checkpoint was sent or it was discarded
+    pub(crate) fn speculation_window_duration(&self, dur: Duration) {
+        self.instruments.speculation_window_duration.records(dur);
+    }
 }
 
 impl Instruments {
@@ -561,6 +627,78 @@ impl Instruments {
                 description: "Count of evictions of cached workflows".into(),
                 unit: "".into(),
             }),
+            optimistic_activity_started: meter.counter(MetricParameters {
+                name: "optimistic_activity_started".into(),
+                description: "Count of activities started optimistically, inside a speculation \
+                              window"
+                    .into(),
+                unit: "".into(),
+            }),
+            optimistic_activity_observed: meter.counter(MetricParameters {
+                name: "optimistic_activity_observed".into(),
+                description: "Count of optimistic activity outcomes the workflow observed inside \
+                              their speculation window"
+                    .into(),
+                unit: "".into(),
+            }),
+            optimistic_activity_handed_off: meter.counter(MetricParameters {
+                name: "optimistic_activity_handed_off".into(),
+                description: "Count of still running optimistic activities the server took over \
+                              at a checkpoint"
+                    .into(),
+                unit: "".into(),
+            }),
+            optimistic_activity_dropped: meter.counter(MetricParameters {
+                name: "optimistic_activity_dropped".into(),
+                description: "Count of optimistic activities whose speculation window was \
+                              discarded or which the server didn't take over"
+                    .into(),
+                unit: "".into(),
+            }),
+            optimistic_timer_started: meter.counter(MetricParameters {
+                name: "optimistic_timer_started".into(),
+                description: "Count of timers started optimistically, inside a speculation window"
+                    .into(),
+                unit: "".into(),
+            }),
+            optimistic_timer_fired: meter.counter(MetricParameters {
+                name: "optimistic_timer_fired".into(),
+                description: "Count of optimistic timer firings the workflow observed inside \
+                              their speculation window"
+                    .into(),
+                unit: "".into(),
+            }),
+            optimistic_timer_cancelled: meter.counter(MetricParameters {
+                name: "optimistic_timer_cancelled".into(),
+                description: "Count of optimistic timers the workflow cancelled inside their \
+                              speculation window"
+                    .into(),
+                unit: "".into(),
+            }),
+            optimistic_timer_handed_off: meter.counter(MetricParameters {
+                name: "optimistic_timer_handed_off".into(),
+                description: "Count of optimistic timers that became server timers at a \
+                              checkpoint"
+                    .into(),
+                unit: "".into(),
+            }),
+            optimistic_start_fallback: meter.counter(MetricParameters {
+                name: "optimistic_start_fallback".into(),
+                description: "Count of speculative commands sent as normal commands instead of \
+                              starting optimistically"
+                    .into(),
+                unit: "".into(),
+            }),
+            speculation_window_checkpoint: meter.counter(MetricParameters {
+                name: "speculation_window_checkpoint".into(),
+                description: "Count of speculation windows checkpointed".into(),
+                unit: "".into(),
+            }),
+            speculation_window_duration: meter.histogram_duration(MetricParameters {
+                name: "speculation_window_duration".into(),
+                unit: "duration".into(),
+                description: "Histogram of how long speculation windows stayed open".into(),
+            }),
         }
     }
 
@@ -638,6 +776,22 @@ impl Instruments {
         self.sticky_cache_size
             .update_attributes(new_attributes.clone());
         self.sticky_cache_forced_evictions
+            .update_attributes(new_attributes.clone());
+        for counter in [
+            &mut self.optimistic_activity_started,
+            &mut self.optimistic_activity_observed,
+            &mut self.optimistic_activity_handed_off,
+            &mut self.optimistic_activity_dropped,
+            &mut self.optimistic_timer_started,
+            &mut self.optimistic_timer_fired,
+            &mut self.optimistic_timer_cancelled,
+            &mut self.optimistic_timer_handed_off,
+            &mut self.optimistic_start_fallback,
+            &mut self.speculation_window_checkpoint,
+        ] {
+            counter.update_attributes(new_attributes.clone());
+        }
+        self.speculation_window_duration
             .update_attributes(new_attributes.clone());
     }
 }
@@ -750,6 +904,9 @@ const KEY_POLLER_TYPE: &str = "poller_type";
 const KEY_WORKER_TYPE: &str = "worker_type";
 const KEY_EAGER: &str = "eager";
 const KEY_TASK_FAILURE_TYPE: &str = "failure_reason";
+const KEY_OPTIMISTIC_OUTCOME: &str = "outcome";
+const KEY_CHECKPOINT_REASON: &str = "checkpoint_reason";
+const KEY_FALLBACK_REASON: &str = "fallback_reason";
 
 pub(crate) fn workflow_poller() -> MetricKeyValue {
     MetricKeyValue::new(KEY_POLLER_TYPE, "workflow_task")
@@ -786,6 +943,15 @@ pub(crate) fn nexus_worker_type() -> MetricKeyValue {
 }
 pub(crate) fn eager(is_eager: bool) -> MetricKeyValue {
     MetricKeyValue::new(KEY_EAGER, is_eager)
+}
+pub(crate) fn optimistic_outcome(outcome: &'static str) -> MetricKeyValue {
+    MetricKeyValue::new(KEY_OPTIMISTIC_OUTCOME, outcome)
+}
+pub(crate) fn checkpoint_reason(reason: &'static str) -> MetricKeyValue {
+    MetricKeyValue::new(KEY_CHECKPOINT_REASON, reason)
+}
+pub(crate) fn fallback_reason(reason: &'static str) -> MetricKeyValue {
+    MetricKeyValue::new(KEY_FALLBACK_REASON, reason)
 }
 pub(crate) enum FailureReason {
     Nondeterminism,
@@ -1257,7 +1423,7 @@ mod tests {
         a2.set(Arc::new(DummyCustomAttrs(2))).unwrap();
         // Verify all metrics are created. This number will need to get updated any time a metric
         // is added.
-        let num_metrics = 35;
+        let num_metrics = 46;
         #[allow(clippy::needless_range_loop)] // Sorry clippy, this reads easier.
         for metric_num in 2..=num_metrics + 1 {
             let hole = assert_matches!(&events[metric_num],
@@ -1273,7 +1439,8 @@ mod tests {
                 attributes,
                 update: MetricUpdateVal::Delta(1)
             }
-            if DummyCustomAttrs::as_id(attributes) == 2 && instrument.get().0 == num_metrics + 1
+            // The forced eviction counter is the 35th instrument created
+            if DummyCustomAttrs::as_id(attributes) == 2 && instrument.get().0 == 35 + 1
         );
         // Verify creating a new context with new attributes merges them properly
         let mc2 = mc.with_new_attrs([MetricKeyValue::new("gotta", "go fast")]);

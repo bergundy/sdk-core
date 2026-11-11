@@ -1,11 +1,11 @@
 //! Speculation windows (optimistic start) driven through a worker with mocked server calls.
 
 use crate::{
-    ActivityHeartbeat, PollError, Worker, WorkerConfig,
-    replay::TestHistoryBuilder,
+    ActivityHeartbeat, PollError, Worker,
+    replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder},
     test_help::{
-        MockPollCfg, build_mock_pollers, drain_pollers_and_shutdown, mock_worker,
-        schedule_local_activity_cmd,
+        CounterRecordingMeter, MockPollCfg, MocksHolder, build_mock_pollers,
+        drain_pollers_and_shutdown, mock_worker, schedule_local_activity_cmd,
     },
     worker::client::{
         MockWorkerClient, WorkflowTaskCompletion, mocks::mock_worker_client,
@@ -25,8 +25,8 @@ use temporalio_common::protos::{
         activity_task::{ActivityTask, activity_task},
         workflow_activation::{WorkflowActivation, workflow_activation_job},
         workflow_commands::{
-            ActivityCancellationType, CompleteWorkflowExecution, RequestCancelActivity,
-            ScheduleActivity, StartTimer, workflow_command,
+            ActivityCancellationType, CancelTimer, CompleteWorkflowExecution,
+            RequestCancelActivity, ScheduleActivity, StartTimer, workflow_command,
         },
         workflow_completion::{self, WorkflowActivationCompletion, workflow_activation_completion},
     },
@@ -76,6 +76,29 @@ async fn optimistic_worker(
     .await
 }
 
+/// Like [optimistic_worker], also recording the worker's metrics.
+async fn optimistic_worker_metered(
+    t: TestHistoryBuilder,
+    client: MockWorkerClient,
+    mut respond: CompletionResponder,
+) -> (
+    Arc<Worker>,
+    UnboundedReceiver<WorkflowTaskCompletion>,
+    Arc<CounterRecordingMeter>,
+) {
+    let meter = Arc::new(CounterRecordingMeter::default());
+    let m = meter.clone();
+    let (core, rx) = optimistic_worker_with(
+        t,
+        client,
+        Box::new(move |wtc| Ok(respond(wtc))),
+        move |mock| mock.set_temporal_meter(m.into_temporal_meter()),
+        optimistic_capabilities(),
+    )
+    .await;
+    (core, rx, meter)
+}
+
 fn optimistic_capabilities() -> Capabilities {
     Capabilities {
         optimistic_start: true,
@@ -87,7 +110,7 @@ async fn optimistic_worker_with(
     t: TestHistoryBuilder,
     mut client: MockWorkerClient,
     mut respond: FallibleCompletionResponder,
-    cfg: impl FnOnce(&mut WorkerConfig),
+    setup: impl FnOnce(&mut MocksHolder),
     capabilities: Capabilities,
 ) -> (Arc<Worker>, UnboundedReceiver<WorkflowTaskCompletion>) {
     client.expect_describe_namespace().returning(move || {
@@ -108,10 +131,8 @@ async fn optimistic_worker_with(
         resp
     }));
     let mut mock = build_mock_pollers(mh);
-    mock.worker_cfg(|wc| {
-        wc.max_cached_workflows = 2;
-        cfg(wc);
-    });
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 2);
+    setup(&mut mock);
     let core = mock_worker(mock);
     core.validate().await.unwrap();
     (Arc::new(core), rx)
@@ -483,7 +504,7 @@ async fn optimistic_activity_tasks_have_server_timeouts() {
 /// A local activity scheduled while the window is open checkpoints the window.
 #[tokio::test]
 async fn non_deferrable_command_checkpoints() {
-    let (core, mut completions) = optimistic_worker(
+    let (core, mut completions, meter) = optimistic_worker_metered(
         history(Duration::from_secs(10)),
         mock_worker_client(),
         Box::new(|_| RespondWorkflowTaskCompletedResponse::default()),
@@ -526,6 +547,19 @@ async fn non_deferrable_command_checkpoints() {
     complete_activity(&core, &token, 1).await;
 
     drain_pollers_and_shutdown(&core).await;
+    assert_eq!(
+        meter.counter_total(
+            "speculation_window_checkpoint",
+            &[("checkpoint_reason", "workflow_completion")]
+        ),
+        1,
+        "speculation_window_checkpoint"
+    );
+    assert_eq!(
+        meter.counter_total("optimistic_activity_dropped", &[("activity_type", "act")]),
+        1,
+        "optimistic_activity_dropped"
+    );
 }
 
 /// Activities still running at the deadline are handed off, with heartbeats held locally until
@@ -546,7 +580,7 @@ async fn deadline_checkpoints_and_heartbeats_follow_handoff() {
         .withf(|token, _| *token == TaskToken::from(b"real-1".to_vec()))
         .times(1)
         .returning(|_, _| Ok(RespondActivityTaskCompletedResponse::default()));
-    let (core, mut completions) = optimistic_worker(
+    let (core, mut completions, meter) = optimistic_worker_metered(
         history(Duration::from_secs(1)),
         client,
         Box::new(|_| RespondWorkflowTaskCompletedResponse {
@@ -615,6 +649,19 @@ async fn deadline_checkpoints_and_heartbeats_follow_handoff() {
     complete_activity(&core, &token, 1).await;
 
     shutdown_with_poller(core, poller).await;
+    assert_eq!(
+        meter.counter_total(
+            "speculation_window_checkpoint",
+            &[("checkpoint_reason", "deadline")]
+        ),
+        1,
+        "speculation_window_checkpoint"
+    );
+    assert_eq!(
+        meter.counter_total("optimistic_activity_handed_off", &[]),
+        1,
+        "optimistic_activity_handed_off"
+    );
 }
 
 /// A failed optimistic activity checkpoints the window and is reported through the normal RPC,
@@ -627,7 +674,7 @@ async fn failure_is_handed_off() {
         .withf(|token, _, _, _| *token == TaskToken::from(b"real-1".to_vec()))
         .times(1)
         .returning(|_, _, _, _| Ok(RespondActivityTaskFailedResponse::default()));
-    let (core, mut completions) = optimistic_worker(
+    let (core, mut completions, meter) = optimistic_worker_metered(
         history(Duration::from_secs(10)),
         client,
         Box::new(|_| RespondWorkflowTaskCompletedResponse {
@@ -658,6 +705,14 @@ async fn failure_is_handed_off() {
     assert_eq!(describe(&wtc.commands), ["schedule act-1 optimistic"]);
 
     shutdown_with_poller(core, poller).await;
+    assert_eq!(
+        meter.counter_total(
+            "speculation_window_checkpoint",
+            &[("checkpoint_reason", "activity_failed")]
+        ),
+        1,
+        "speculation_window_checkpoint"
+    );
 }
 
 /// Async completion isn't possible with a made up token, so the attempt fails and the failure
@@ -840,6 +895,10 @@ async fn next_task_applies_batch_without_jobs() {
 
 fn cancel_activity(seq: u32) -> workflow_command::Variant {
     RequestCancelActivity { seq }.into()
+}
+
+fn cancel_timer(seq: u32) -> workflow_command::Variant {
+    CancelTimer { seq }.into()
 }
 
 /// A TryCancel cancellation of an optimistic activity references its predicted scheduled event
@@ -1055,11 +1114,13 @@ async fn large_batch_is_paginated() {
 /// dropped, and the batch is never sent again.
 #[tokio::test]
 async fn rejected_checkpoint_drops_window() {
+    let meter = Arc::new(CounterRecordingMeter::default());
+    let m = meter.clone();
     let (core, mut completions) = optimistic_worker_with(
         history(Duration::from_secs(10)),
         mock_worker_client(),
         Box::new(|_| Err(tonic::Status::invalid_argument("UnhandledCommand"))),
-        |_| {},
+        move |mock| mock.set_temporal_meter(m.into_temporal_meter()),
         optimistic_capabilities(),
     )
     .await;
@@ -1089,6 +1150,11 @@ async fn rejected_checkpoint_drops_window() {
     complete_activity(&core, &token, 1).await;
     drain_pollers_and_shutdown(&core).await;
     assert!(completions.try_recv().is_err());
+    assert_eq!(
+        meter.counter_total("optimistic_activity_dropped", &[]),
+        1,
+        "optimistic_activity_dropped"
+    );
 }
 
 /// Exiting a block and entering the next in the same activation keeps the window going.
@@ -1189,4 +1255,122 @@ async fn local_activity_checkpoints_window() {
     .await
     .unwrap();
     drain_pollers_and_shutdown(&core).await;
+}
+
+/// Metrics follow a window from its optimistic starts to the checkpoint and handoff.
+#[tokio::test]
+async fn metrics_follow_window_lifecycle() {
+    let mut client = mock_worker_client();
+    client
+        .expect_complete_activity_task()
+        .times(1)
+        .returning(|_, _| Ok(RespondActivityTaskCompletedResponse::default()));
+    let (core, mut completions, meter) = optimistic_worker_metered(
+        history(Duration::from_secs(10)),
+        client,
+        Box::new(|_| RespondWorkflowTaskCompletedResponse {
+            optimistic_activity_tasks: vec![handed_off("act-1", b"real-1")],
+            ..Default::default()
+        }),
+    )
+    .await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    let run_id = act.run_id.clone();
+    core.complete_workflow_activation(completion(
+        &run_id,
+        vec![
+            speculative_activity(&core, 1),
+            speculative_activity(&core, 2),
+            speculative_timer(3, Duration::from_millis(300)),
+            speculative_timer(4, Duration::from_secs(10)),
+        ],
+        false,
+        true,
+    ))
+    .await
+    .unwrap();
+    let (token1, _) = poll_start(&core).await;
+    let (token2, _) = poll_start(&core).await;
+    complete_activity(&core, &token2, 2).await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(resolved_seq(&act), ["act-2"]);
+    core.complete_workflow_activation(completion(&run_id, vec![], false, true))
+        .await
+        .unwrap();
+    let act = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(resolved_seq(&act), ["timer-3"]);
+    core.complete_workflow_activation(completion(&run_id, vec![cancel_timer(4)], true, false))
+        .await
+        .unwrap();
+    completions.recv().await.unwrap();
+    complete_activity(&core, &token1, 1).await;
+    drain_pollers_and_shutdown(&core).await;
+
+    let wf = ("workflow_type", DEFAULT_WORKFLOW_TYPE);
+    let act_type = ("activity_type", "act");
+    for (name, labels, expected) in [
+        ("optimistic_activity_started", vec![wf, act_type], 2),
+        (
+            "optimistic_activity_observed",
+            vec![wf, act_type, ("outcome", "completed")],
+            1,
+        ),
+        ("optimistic_activity_handed_off", vec![act_type], 1),
+        ("optimistic_activity_dropped", vec![], 0),
+        ("optimistic_timer_started", vec![wf], 2),
+        ("optimistic_timer_fired", vec![wf], 1),
+        ("optimistic_timer_cancelled", vec![wf], 1),
+        ("optimistic_timer_handed_off", vec![wf], 0),
+        ("optimistic_start_fallback", vec![], 0),
+        (
+            "speculation_window_checkpoint",
+            vec![wf, ("checkpoint_reason", "block_exit")],
+            1,
+        ),
+    ] {
+        assert_eq!(meter.counter_total(name, &labels), expected, "{name}");
+    }
+    assert_eq!(
+        meter.durations("speculation_window_duration", &[wf]).len(),
+        1
+    );
+}
+
+/// Speculative commands that can't start optimistically are counted with the reason.
+#[tokio::test]
+async fn metrics_count_fallbacks() {
+    let (core, mut completions, meter) = optimistic_worker_metered(
+        history(Duration::from_secs(10)),
+        mock_worker_client(),
+        Box::new(|_| RespondWorkflowTaskCompletedResponse::default()),
+    )
+    .await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    let mut other_queue = speculative_activity(&core, 2);
+    if let workflow_command::Variant::ScheduleActivity(a) = &mut other_queue {
+        a.task_queue = "elsewhere".to_owned();
+    }
+    core.complete_workflow_activation(completion(
+        &act.run_id,
+        vec![
+            speculative_activity(&core, 1),
+            other_queue,
+            speculative_timer(3, Duration::from_secs(1)),
+        ],
+        false,
+        true,
+    ))
+    .await
+    .unwrap();
+    completions.recv().await.unwrap();
+    drain_pollers_and_shutdown(&core).await;
+    assert_eq!(
+        meter.counter_total(
+            "optimistic_start_fallback",
+            &[("fallback_reason", "task_queue")]
+        ),
+        3
+    );
+    assert_eq!(meter.counter_total("optimistic_activity_started", &[]), 0);
+    assert_eq!(meter.counter_total("speculation_window_checkpoint", &[]), 0);
 }

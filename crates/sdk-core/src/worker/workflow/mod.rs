@@ -34,7 +34,7 @@ use crate::{
             LegacyQueryResult, REQUEST_TOO_LARGE_KEY, WorkerClient, WorkflowTaskCompletion,
             payload_limit_violation_from,
         },
-        optimistic_activities::OptimisticActivities,
+        optimistic_activities::{Handoff, OptimisticActivities},
         workflow::{
             history_update::HistoryPaginator,
             machines::MachineError,
@@ -204,9 +204,20 @@ impl Workflows {
                     span: Span::current(),
                 });
             });
+            let activities = activity_tasks_handle.clone().ok_or_else(|| {
+                if basics
+                    .worker_config
+                    .max_task_queue_activities_per_second
+                    .is_some_and(|rps| rps > 0.0)
+                {
+                    optimistic::FallbackReason::RateLimited
+                } else {
+                    optimistic::FallbackReason::NoActivityWorker
+                }
+            });
             basics.optimistic_env = Some(Arc::new(optimistic::OptimisticRuntime::new(
                 basics.namespace_capabilities.clone(),
-                activity_tasks_handle.clone(),
+                activities,
                 registry.clone(),
                 local_tx.clone(),
             )));
@@ -472,7 +483,9 @@ impl Workflows {
                                 reset_last_started_to = Some(response.reset_history_event_id);
                             }
                             if let Some(registry) = self.optimistic_activities.as_ref() {
-                                registry.handoff(run_id, &response.optimistic_activity_tasks);
+                                let handoff =
+                                    registry.handoff(run_id, &response.optimistic_activity_tasks);
+                                record_handoff_metrics(&run_metrics, handoff);
                             }
                             if let Some(wft) = response.workflow_task {
                                 *wft_from_complete = Some(validate_wft(wft)?);
@@ -486,7 +499,13 @@ impl Workflows {
                             // A rejected batch is never resent, so whatever its optimistic
                             // activities do no longer matters.
                             if let Some(registry) = self.optimistic_activities.as_ref() {
-                                registry.drop_run(run_id);
+                                record_handoff_metrics(
+                                    &run_metrics,
+                                    Handoff {
+                                        handed_off: vec![],
+                                        dropped: registry.drop_run(run_id),
+                                    },
+                                );
                             }
                             let cause_and_failure =
                                 if e.metadata().contains_key(REQUEST_TOO_LARGE_KEY) {
@@ -1239,6 +1258,19 @@ impl EvictionRequestResult {
                 None
             }
         }
+    }
+}
+
+fn record_handoff_metrics(metrics: &MetricsContext, handoff: Handoff) {
+    for activity_type in handoff.handed_off {
+        metrics
+            .with_new_attrs([metrics::activity_type(activity_type)])
+            .optimistic_activity_handed_off();
+    }
+    for activity_type in handoff.dropped {
+        metrics
+            .with_new_attrs([metrics::activity_type(activity_type)])
+            .optimistic_activity_dropped();
     }
 }
 
