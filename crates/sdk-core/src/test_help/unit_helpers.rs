@@ -5,6 +5,7 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use temporalio_common::{
     protos::coresdk::{
@@ -15,17 +16,24 @@ use temporalio_common::{
         TaskQueueLabelStrategy,
         metrics::{
             CoreMeter, Counter, CounterBase, Gauge, GaugeF64, Histogram, HistogramDuration,
-            HistogramF64, MetricAttributable, MetricAttributes, MetricParameters, NewAttributes,
-            NoOpCoreMeter, TemporalMeter, UpDownCounter,
+            HistogramDurationBase, HistogramF64, MetricAttributable, MetricAttributes,
+            MetricParameters, NewAttributes, NoOpCoreMeter, TemporalMeter, UpDownCounter,
         },
     },
 };
 
-/// A meter that records counter increments in memory so unit tests can assert on them. All other
-/// instrument kinds are discarded.
+/// A meter that records counter increments and duration histogram observations in memory so unit
+/// tests can assert on them. All other instrument kinds are discarded.
 #[derive(Debug, Default)]
 pub struct CounterRecordingMeter {
     adds: Arc<Mutex<Vec<CounterAdd>>>,
+    durations: Arc<Mutex<Vec<DurationRecord>>>,
+}
+#[derive(Debug)]
+struct DurationRecord {
+    name: String,
+    labels: HashMap<String, String>,
+    value: Duration,
 }
 #[derive(Debug)]
 struct CounterAdd {
@@ -56,6 +64,55 @@ impl CounterRecordingMeter {
             })
             .map(|a| a.value)
             .sum()
+    }
+
+    /// All observations of the named duration histogram whose labels include every provided pair
+    pub fn durations(&self, name: &str, labels: &[(&str, &str)]) -> Vec<Duration> {
+        self.durations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|d| {
+                d.name == name
+                    && labels
+                        .iter()
+                        .all(|(k, v)| d.labels.get(*k).map(String::as_str) == Some(*v))
+            })
+            .map(|d| d.value)
+            .collect()
+    }
+}
+struct RecordingDurations {
+    name: String,
+    records: Arc<Mutex<Vec<DurationRecord>>>,
+}
+impl MetricAttributable<Box<dyn HistogramDurationBase>> for RecordingDurations {
+    fn with_attributes(
+        &self,
+        attributes: &MetricAttributes,
+    ) -> Result<Box<dyn HistogramDurationBase>, Box<dyn std::error::Error>> {
+        let MetricAttributes::NoOp(labels) = attributes else {
+            panic!("CounterRecordingMeter only works with NoOp attributes");
+        };
+        Ok(Box::new(BoundRecordingDurations {
+            name: self.name.clone(),
+            labels: (**labels).clone(),
+            records: self.records.clone(),
+        }))
+    }
+}
+struct BoundRecordingDurations {
+    name: String,
+    labels: HashMap<String, String>,
+    records: Arc<Mutex<Vec<DurationRecord>>>,
+}
+impl HistogramDurationBase for BoundRecordingDurations {
+    fn records(&self, value: Duration) {
+        self.records.lock().unwrap().push(DurationRecord {
+            name: self.name.clone(),
+            labels: self.labels.clone(),
+            value,
+        });
     }
 }
 struct RecordingCounter {
@@ -115,7 +172,10 @@ impl CoreMeter for CounterRecordingMeter {
         NoOpCoreMeter.histogram_f64(params)
     }
     fn histogram_duration(&self, params: MetricParameters) -> HistogramDuration {
-        NoOpCoreMeter.histogram_duration(params)
+        HistogramDuration::new(Arc::new(RecordingDurations {
+            name: params.name.to_string(),
+            records: self.durations.clone(),
+        }))
     }
     fn gauge(&self, params: MetricParameters) -> Gauge {
         NoOpCoreMeter.gauge(params)

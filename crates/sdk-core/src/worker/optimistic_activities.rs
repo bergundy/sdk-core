@@ -46,11 +46,19 @@ pub(crate) enum HeartbeatRoute {
     Discard,
 }
 
+/// Activities whose fate a checkpoint decided, by activity type.
+#[derive(Debug, Default)]
+pub(crate) struct Handoff {
+    pub(crate) handed_off: Vec<String>,
+    pub(crate) dropped: Vec<String>,
+}
+
 struct Entry {
     run_id: String,
     generation: u64,
     seq: u32,
     activity_id: String,
+    activity_type: String,
     fate: watch::Sender<Fate>,
     heartbeat_details: Option<Vec<temporalio_common::protos::temporal::api::common::v1::Payload>>,
 }
@@ -106,6 +114,7 @@ impl OptimisticActivities {
                 generation,
                 seq,
                 activity_id: task.activity_id.clone(),
+                activity_type: task.activity_type.clone().unwrap_or_default().name,
                 fate: watch::Sender::new(Fate::InWindow),
                 heartbeat_details: None,
             },
@@ -198,8 +207,9 @@ impl OptimisticActivities {
     /// Hands still running activities of a checkpointed window over to the server, matching them
     /// to the tasks the server returned by activity id. Activities the server didn't return (ex:
     /// because the workflow closed) are discarded.
-    pub(crate) fn handoff(&self, run_id: &str, tasks: &[PollActivityTaskQueueResponse]) {
+    pub(crate) fn handoff(&self, run_id: &str, tasks: &[PollActivityTaskQueueResponse]) -> Handoff {
         let mut to_cancel = vec![];
+        let mut handoff = Handoff::default();
         {
             let mut inner = self.inner.lock();
             let mut real_tokens = vec![];
@@ -214,23 +224,27 @@ impl OptimisticActivities {
                                "Handed off optimistic activity");
                         e.fate.send_replace(Fate::HandedOff(real.clone()));
                         real_tokens.push((real, token.clone()));
+                        handoff.handed_off.push(e.activity_type.clone());
                     }
                     None => {
                         debug!(activity_id = %e.activity_id,
                                "Server didn't take over optimistic activity, discarding it");
                         e.fate.send_replace(Fate::Dropped);
                         to_cancel.push(token.clone());
+                        handoff.dropped.push(e.activity_type.clone());
                     }
                 }
             }
             inner.synthetic_by_real.extend(real_tokens);
         }
         self.cancel_all(to_cancel);
+        handoff
     }
 
     /// Discards a run's activities whose window was discarded or never accepted by the server.
-    pub(crate) fn drop_run(&self, run_id: &str) {
-        let to_cancel: Vec<_> = {
+    /// Returns their activity types.
+    pub(crate) fn drop_run(&self, run_id: &str) -> Vec<String> {
+        let (to_cancel, dropped): (Vec<_>, Vec<_>) = {
             let inner = self.inner.lock();
             inner
                 .by_token
@@ -238,11 +252,12 @@ impl OptimisticActivities {
                 .filter(|(_, e)| e.run_id == run_id && *e.fate.borrow() == Fate::InWindow)
                 .map(|(token, e)| {
                     e.fate.send_replace(Fate::Dropped);
-                    token.clone()
+                    (token.clone(), e.activity_type.clone())
                 })
-                .collect()
+                .unzip()
         };
         self.cancel_all(to_cancel);
+        dropped
     }
 
     /// Asks lang to cancel a local execution on the workflow's request.
