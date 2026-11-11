@@ -13,6 +13,7 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
+    time::Instant,
 };
 use temporalio_client::worker::CancelActivityCallback;
 use temporalio_common::protos::{
@@ -23,6 +24,7 @@ use temporalio_common::protos::{
 use tokio::sync::watch;
 
 type Forwarder = Box<dyn Fn(String, LocalResolution) + Send + Sync>;
+type HandoffCallback = Box<dyn Fn(&TaskToken, Instant) + Send + Sync>;
 
 /// What happens to an optimistic activity's outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +61,8 @@ struct Entry {
     seq: u32,
     activity_id: String,
     activity_type: String,
+    /// When the activity started, which the server backdates its scheduled and started times to.
+    started_at: Instant,
     fate: watch::Sender<Fate>,
     heartbeat_details: Option<Vec<temporalio_common::protos::temporal::api::common::v1::Payload>>,
 }
@@ -75,6 +79,7 @@ pub(crate) struct OptimisticActivities {
     next_id: AtomicU64,
     forward: OnceLock<Forwarder>,
     cancel: OnceLock<CancelActivityCallback>,
+    on_handoff: OnceLock<HandoffCallback>,
 }
 
 impl OptimisticActivities {
@@ -88,6 +93,25 @@ impl OptimisticActivities {
         f: impl Fn(String, LocalResolution) + Send + Sync + 'static,
     ) {
         let _ = self.forward.set(Box::new(f));
+    }
+
+    /// Sets what to do for an activity once the server took it over, given its token and when it
+    /// started.
+    pub(crate) fn set_handoff_callback(
+        &self,
+        f: impl Fn(&TaskToken, Instant) + Send + Sync + 'static,
+    ) {
+        let _ = self.on_handoff.set(Box::new(f));
+    }
+
+    /// When a handed off activity started, if it was handed off.
+    pub(crate) fn handed_off_start(&self, token: &TaskToken) -> Option<Instant> {
+        self.inner
+            .lock()
+            .by_token
+            .get(token)
+            .filter(|e| matches!(*e.fate.borrow(), Fate::HandedOff(_)))
+            .map(|e| e.started_at)
     }
 
     /// Sets how local executions are asked to stop.
@@ -115,6 +139,7 @@ impl OptimisticActivities {
                 seq,
                 activity_id: task.activity_id.clone(),
                 activity_type: task.activity_type.clone().unwrap_or_default().name,
+                started_at: Instant::now(),
                 fate: watch::Sender::new(Fate::InWindow),
                 heartbeat_details: None,
             },
@@ -210,6 +235,7 @@ impl OptimisticActivities {
     pub(crate) fn handoff(&self, run_id: &str, tasks: &[PollActivityTaskQueueResponse]) -> Handoff {
         let mut to_cancel = vec![];
         let mut handoff = Handoff::default();
+        let mut handed_off_tokens = vec![];
         {
             let mut inner = self.inner.lock();
             let mut real_tokens = vec![];
@@ -225,6 +251,7 @@ impl OptimisticActivities {
                         e.fate.send_replace(Fate::HandedOff(real.clone()));
                         real_tokens.push((real, token.clone()));
                         handoff.handed_off.push(e.activity_type.clone());
+                        handed_off_tokens.push((token.clone(), e.started_at));
                     }
                     None => {
                         debug!(activity_id = %e.activity_id,
@@ -236,6 +263,11 @@ impl OptimisticActivities {
                 }
             }
             inner.synthetic_by_real.extend(real_tokens);
+        }
+        if let Some(on_handoff) = self.on_handoff.get() {
+            for (token, started_at) in handed_off_tokens {
+                on_handoff(&token, started_at);
+            }
         }
         self.cancel_all(to_cancel);
         handoff
