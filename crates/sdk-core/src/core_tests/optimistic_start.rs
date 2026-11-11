@@ -7,7 +7,10 @@ use crate::{
         MockPollCfg, build_mock_pollers, drain_pollers_and_shutdown, mock_worker,
         schedule_local_activity_cmd,
     },
-    worker::client::{MockWorkerClient, WorkflowTaskCompletion, mocks::mock_worker_client},
+    worker::client::{
+        MockWorkerClient, WorkflowTaskCompletion, mocks::mock_worker_client,
+        wft_completion_command_pages,
+    },
 };
 use futures_util::FutureExt;
 use std::{
@@ -63,7 +66,21 @@ async fn optimistic_worker(
     client: MockWorkerClient,
     mut respond: CompletionResponder,
 ) -> (Arc<Worker>, UnboundedReceiver<WorkflowTaskCompletion>) {
-    optimistic_worker_with(t, client, Box::new(move |wtc| Ok(respond(wtc))), |_| {}).await
+    optimistic_worker_with(
+        t,
+        client,
+        Box::new(move |wtc| Ok(respond(wtc))),
+        |_| {},
+        optimistic_capabilities(),
+    )
+    .await
+}
+
+fn optimistic_capabilities() -> Capabilities {
+    Capabilities {
+        optimistic_start: true,
+        ..Default::default()
+    }
 }
 
 async fn optimistic_worker_with(
@@ -71,14 +88,12 @@ async fn optimistic_worker_with(
     mut client: MockWorkerClient,
     mut respond: FallibleCompletionResponder,
     cfg: impl FnOnce(&mut WorkerConfig),
+    capabilities: Capabilities,
 ) -> (Arc<Worker>, UnboundedReceiver<WorkflowTaskCompletion>) {
-    client.expect_describe_namespace().returning(|| {
+    client.expect_describe_namespace().returning(move || {
         Ok(DescribeNamespaceResponse {
             namespace_info: Some(NamespaceInfo {
-                capabilities: Some(Capabilities {
-                    optimistic_start: true,
-                    ..Default::default()
-                }),
+                capabilities: Some(capabilities),
                 ..Default::default()
             }),
             ..Default::default()
@@ -955,57 +970,85 @@ async fn wait_cancellation_completed_resolves_in_window() {
     drain_pollers_and_shutdown(&core).await;
 }
 
-/// A result that doesn't fit the payload budget isn't delivered in the window. The window
-/// checkpoints and the result is reported through the normal RPC.
+/// A batch too large for one request goes out as a paginated completion when the namespace
+/// supports it, with its commands in the same order.
 #[tokio::test]
-async fn payload_budget_checkpoints() {
-    let big = Payload {
-        data: vec![b'x'; 2048],
+async fn large_batch_is_paginated() {
+    let big = |seq: u32| Payload {
+        data: vec![b'0' + seq as u8; 1536 * 1024],
         ..Default::default()
     };
-    let expected = big.clone();
-    let mut client = mock_worker_client();
-    client
-        .expect_complete_activity_task()
-        .withf(move |token, res| {
-            *token == TaskToken::from(b"real-1".to_vec())
-                && res.as_ref().map(|p| p.payloads.clone()) == Some(vec![expected.clone()])
-        })
-        .times(1)
-        .returning(|_, _| Ok(RespondActivityTaskCompletedResponse::default()));
     let (core, mut completions) = optimistic_worker_with(
         history(Duration::from_secs(10)),
-        client,
-        Box::new(|_| {
-            Ok(RespondWorkflowTaskCompletedResponse {
-                optimistic_activity_tasks: vec![handed_off("act-1", b"real-1")],
-                ..Default::default()
-            })
-        }),
-        |wc| wc.optimistic_start_payload_budget = 1024,
+        mock_worker_client(),
+        Box::new(|_| Ok(RespondWorkflowTaskCompletedResponse::default())),
+        |_| {},
+        Capabilities {
+            optimistic_start: true,
+            workflow_task_completion_pagination: true,
+            ..Default::default()
+        },
     )
     .await;
     let act = core.poll_workflow_activation().await.unwrap();
     let run_id = act.run_id.clone();
-    core.complete_workflow_activation(completion(
-        &run_id,
-        vec![speculative_activity(&core, 1)],
-        false,
-        true,
-    ))
-    .await
-    .unwrap();
-    let poller = idle_workflow_poller(core.clone());
-    let (token, _) = poll_start(&core).await;
-    core.complete_activity_task(ActivityTaskCompletion {
-        task_token: token.into_inner(),
-        result: Some(ActivityExecutionResult::ok(big)),
-    })
-    .await
-    .unwrap();
+    let commands = (1..=3)
+        .map(|seq| {
+            let mut cmd = speculative_activity(&core, seq);
+            if let workflow_command::Variant::ScheduleActivity(a) = &mut cmd {
+                a.arguments = vec![big(seq)];
+            }
+            cmd
+        })
+        .collect();
+    core.complete_workflow_activation(completion(&run_id, commands, false, true))
+        .await
+        .unwrap();
+    let mut tokens = vec![];
+    for _ in 1..=3 {
+        tokens.push(poll_start(&core).await.0);
+    }
+    for (ix, token) in tokens.into_iter().enumerate() {
+        let seq = ix as u32 + 1;
+        core.complete_activity_task(ActivityTaskCompletion {
+            task_token: token.into_inner(),
+            result: Some(ActivityExecutionResult::ok(big(seq + 3))),
+        })
+        .await
+        .unwrap();
+        let act = core.poll_workflow_activation().await.unwrap();
+        assert_eq!(act.jobs.len(), 1);
+        let cmds = if seq == 3 {
+            vec![complete_workflow()]
+        } else {
+            vec![]
+        };
+        core.complete_workflow_activation(completion(&run_id, cmds, seq == 3, seq != 3))
+            .await
+            .unwrap();
+    }
     let wtc = completions.recv().await.unwrap();
-    assert_eq!(describe(&wtc.commands), ["schedule act-1 optimistic"]);
-    shutdown_with_poller(core, poller).await;
+    assert!(wtc.pagination_enabled);
+    assert_eq!(
+        describe(&wtc.commands),
+        [
+            "schedule act-1 optimistic",
+            "schedule act-2 optimistic",
+            "schedule act-3 optimistic",
+            "resolve 5 completed",
+            "resolve 6 completed",
+            "resolve 7 completed",
+            "complete"
+        ]
+    );
+    let pages = wft_completion_command_pages(wtc.commands.clone());
+    assert!(
+        pages.len() > 2,
+        "expected several pages, got {}",
+        pages.len()
+    );
+    assert_eq!(pages.concat(), wtc.commands);
+    drain_pollers_and_shutdown(&core).await;
 }
 
 /// When the server rejects the checkpoint, local executions are cancelled, their outcomes are
@@ -1017,6 +1060,7 @@ async fn rejected_checkpoint_drops_window() {
         mock_worker_client(),
         Box::new(|_| Err(tonic::Status::invalid_argument("UnhandledCommand"))),
         |_| {},
+        optimistic_capabilities(),
     )
     .await;
     let act = core.poll_workflow_activation().await.unwrap();
