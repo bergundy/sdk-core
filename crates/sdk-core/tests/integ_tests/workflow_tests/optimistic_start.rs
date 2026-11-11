@@ -12,8 +12,8 @@ use temporalio_common::protos::{
         activity_task::{ActivityTask, activity_task},
         workflow_activation::{WorkflowActivation, workflow_activation_job},
         workflow_commands::{
-            ActivityCancellationType, CompleteWorkflowExecution, ScheduleActivity, StartTimer,
-            workflow_command,
+            ActivityCancellationType, CancelTimer, CompleteWorkflowExecution,
+            RequestCancelActivity, ScheduleActivity, StartTimer, workflow_command,
         },
         workflow_completion::{self, WorkflowActivationCompletion, workflow_activation_completion},
     },
@@ -635,5 +635,253 @@ async fn optimistic_start_signal_during_window() {
         replayed.iter().map(|o| &o.jobs).collect::<Vec<_>>(),
         jobs.iter().collect::<Vec<_>>()
     );
+    drain_pollers_and_shutdown(&core).await;
+}
+
+fn cancel_activity(seq: u32) -> workflow_command::Variant {
+    RequestCancelActivity { seq }.into()
+}
+
+fn cancel_timer(seq: u32) -> workflow_command::Variant {
+    CancelTimer { seq }.into()
+}
+
+/// The checkpoint completes the workflow while an optimistic activity still runs. The server
+/// hands it off anyway, Core cancels the local execution since nothing can observe it, and its
+/// outcome is reported with the server's token.
+#[tokio::test]
+async fn optimistic_start_workflow_closes_in_checkpoint() {
+    let mut starter = CoreWfStarter::new("optimistic_start_closes_in_checkpoint");
+    starter.set_core_cfg_mutator(|c| c.max_cached_workflows = 10);
+    let core = starter.get_core_worker().await;
+    core.validate().await.unwrap();
+    starter.start_wf().await;
+    let tq = starter.get_task_queue().to_owned();
+
+    let workflow = {
+        let tq = tq.clone();
+        move |jobs: &[String]| -> Response {
+            match jobs {
+                [j] if j == "init" => in_block(vec![
+                    speculative_activity(&tq, 1),
+                    speculative_timer(2, Duration::from_millis(200)),
+                ]),
+                [j] if j == "timer-2" => complete_workflow(),
+                other => panic!("unexpected jobs {other:?}"),
+            }
+        }
+    };
+    let activities = async {
+        let (token, _, _) = poll_start(&core).await;
+        let cancel = core.poll_activity_task().await.unwrap();
+        assert_eq!(TaskToken::from(cancel.task_token), token);
+        assert_matches!(cancel.variant, Some(activity_task::Variant::Cancel(_)));
+        core.complete_activity_task(ActivityTaskCompletion {
+            task_token: token.into_inner(),
+            result: Some(ActivityExecutionResult::cancel_from_details(None)),
+        })
+        .await
+        .unwrap();
+    };
+    let mut wf = workflow.clone();
+    let (observed, _) = tokio::join!(run_workflow(&core, &mut wf), activities);
+    let jobs: Vec<_> = observed.iter().map(|o| o.jobs.clone()).collect();
+    assert_eq!(jobs, [vec!["init"], vec!["timer-2"]]);
+
+    let events = starter.get_history().await.events;
+    let described: Vec<_> = events.iter().map(describe).collect();
+    assert_eq!(
+        described[3..],
+        [
+            "WorkflowTaskCompleted",
+            "ActivityTaskScheduled act-1 optimistic",
+            "TimerStarted 2 optimistic",
+            "TimerFired 2 optimistic",
+            "WorkflowExecutionCompleted",
+        ]
+    );
+    let replayed = replay(&tq, events, workflow).await;
+    assert_eq!(replayed, observed);
+    drain_pollers_and_shutdown(&core).await;
+}
+
+/// An activity scheduled and cancelled in the same activation, between other optimistic commands,
+/// is dropped: it isn't dispatched or recorded, and the commands around it are recorded with the
+/// event ids Core predicted for them.
+#[tokio::test]
+async fn optimistic_start_schedule_and_cancel_in_same_activation() {
+    let mut starter = CoreWfStarter::new("optimistic_start_same_activation_cancel");
+    let core = starter.get_core_worker().await;
+    core.validate().await.unwrap();
+    starter.start_wf().await;
+    let tq = starter.get_task_queue().to_owned();
+
+    let workflow = {
+        let tq = tq.clone();
+        move |jobs: &[String]| -> Response {
+            match jobs {
+                [j] if j == "init" => in_block(vec![
+                    speculative_activity(&tq, 1),
+                    speculative_activity(&tq, 2),
+                    cancel_activity(2),
+                    speculative_activity(&tq, 3),
+                    speculative_timer(4, Duration::from_millis(100)),
+                ]),
+                [j] if j == "act-2-cancelled" => in_block(vec![]),
+                [j] if j == "act-1" || j == "act-3" || j == "timer-4" => in_block(vec![]),
+                other => panic!("unexpected jobs {other:?}"),
+            }
+        }
+    };
+    let activities = async {
+        let (t1, id1, _) = poll_start(&core).await;
+        let (t3, id3, _) = poll_start(&core).await;
+        assert_eq!((id1.as_str(), id3.as_str()), ("act-1", "act-3"));
+        complete_activity(&core, &t1, 1).await;
+        complete_activity(&core, &t3, 3).await;
+    };
+    // The workflow waits for both activities and the timer, then exits its block and completes
+    let mut seen = 0;
+    let mut wf = {
+        let workflow = workflow.clone();
+        move |jobs: &[String]| -> Response {
+            let resp = workflow(jobs);
+            if jobs
+                .iter()
+                .any(|j| j == "act-1" || j == "act-3" || j == "timer-4")
+            {
+                seen += 1;
+                if seen == 3 {
+                    return Response {
+                        commands: vec![CompleteWorkflowExecution::default().into()],
+                        exited: true,
+                        done: true,
+                        ..Default::default()
+                    };
+                }
+            }
+            resp
+        }
+    };
+    let (observed, _) = tokio::join!(run_workflow(&core, &mut wf), activities);
+    assert_eq!(observed[0].jobs, ["init"]);
+    assert_eq!(observed[1].jobs, ["act-2-cancelled"]);
+    assert_eq!(observed.len(), 5);
+
+    let events = starter.get_history().await.events;
+    let described: Vec<_> = events.iter().map(describe).collect();
+    assert_eq!(
+        described[3..7],
+        [
+            "WorkflowTaskCompleted",
+            "ActivityTaskScheduled act-1 optimistic",
+            "ActivityTaskScheduled act-3 optimistic",
+            "TimerStarted 4 optimistic",
+        ]
+    );
+    assert!(!described.iter().any(|d| d.contains("act-2")));
+    let mut resolved: Vec<_> = described[7..]
+        .iter()
+        .filter(|d| d.starts_with("ActivityTaskCompleted") || d.starts_with("TimerFired"))
+        .cloned()
+        .collect();
+    resolved.sort();
+    assert_eq!(
+        resolved,
+        [
+            "ActivityTaskCompleted 5 optimistic",
+            "ActivityTaskCompleted 6 optimistic",
+            "TimerFired 4 optimistic"
+        ]
+    );
+    // Replay has to deliver the resolutions in the order they were observed
+    let mut seen = 0;
+    let replayed = replay(&tq, events, move |jobs: &[String]| {
+        let resp = workflow(jobs);
+        if jobs
+            .iter()
+            .any(|j| j == "act-1" || j == "act-3" || j == "timer-4")
+        {
+            seen += 1;
+            if seen == 3 {
+                return Response {
+                    commands: vec![CompleteWorkflowExecution::default().into()],
+                    exited: true,
+                    done: true,
+                    ..Default::default()
+                };
+            }
+        }
+        resp
+    })
+    .await;
+    assert_eq!(replayed, observed);
+    drain_pollers_and_shutdown(&core).await;
+}
+
+/// Two timers fire together. The workflow cancels the one it hasn't seen yet when the other is
+/// delivered, so that firing, already known to Core, must never be delivered or recorded.
+#[tokio::test]
+async fn optimistic_start_timer_cancel_races_firing() {
+    let mut starter = CoreWfStarter::new("optimistic_start_timer_race");
+    let core = starter.get_core_worker().await;
+    core.validate().await.unwrap();
+    starter.start_wf().await;
+    let tq = starter.get_task_queue().to_owned();
+
+    let workflow = |jobs: &[String]| -> Response {
+        match jobs {
+            [j] if j == "init" => in_block(vec![
+                speculative_timer(1, Duration::from_millis(300)),
+                speculative_timer(2, Duration::from_millis(300)),
+            ]),
+            [j] if j == "timer-1" => Response {
+                commands: vec![cancel_timer(2), CompleteWorkflowExecution::default().into()],
+                exited: true,
+                done: true,
+                ..Default::default()
+            },
+            [j] if j == "timer-2" => Response {
+                commands: vec![cancel_timer(1), CompleteWorkflowExecution::default().into()],
+                exited: true,
+                done: true,
+                ..Default::default()
+            },
+            other => panic!("unexpected jobs {other:?}"),
+        }
+    };
+    let mut wf = workflow;
+    let observed = run_workflow(&core, &mut wf).await;
+    assert_eq!(observed.len(), 2);
+    let fired = &observed[1].jobs[0];
+    let (fired_id, cancelled_id) = if fired == "timer-1" {
+        ("1", "2")
+    } else {
+        ("2", "1")
+    };
+
+    let events = starter.get_history().await.events;
+    let described: Vec<_> = events.iter().map(describe).collect();
+    assert_eq!(
+        described[3..],
+        [
+            "WorkflowTaskCompleted".to_owned(),
+            "TimerStarted 1 optimistic".to_owned(),
+            "TimerStarted 2 optimistic".to_owned(),
+            format!("TimerFired {fired_id} optimistic"),
+            "TimerCanceled".to_owned(),
+            "WorkflowExecutionCompleted".to_owned(),
+        ]
+    );
+    let canceled = events
+        .iter()
+        .find_map(|e| match e.attributes.as_ref() {
+            Some(Attributes::TimerCanceledEventAttributes(a)) => Some(a.timer_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(canceled, cancelled_id);
+    let replayed = replay(&tq, events, workflow).await;
+    assert_eq!(replayed, observed);
     drain_pollers_and_shutdown(&core).await;
 }

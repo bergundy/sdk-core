@@ -1547,6 +1547,24 @@ mod tests {
             assert_eq!(total_commands, command_count);
         }
 
+        /// The server reads request level fields only from the final page.
+        #[test]
+        fn request_level_fields_ride_on_the_final_page() {
+            let mut request = request_with((0..6).map(|_| command_with_payload(400)).collect());
+            request.worker_control_task_queue = "control".to_string();
+            request.force_create_new_workflow_task = true;
+            request.return_new_workflow_task = true;
+            let WftCompletionPages::Paginated { final_page, .. } =
+                paginate_wft_completion(request, 1024)
+            else {
+                panic!("expected multiple pages");
+            };
+            assert_eq!(final_page.worker_control_task_queue, "control");
+            assert_eq!(final_page.identity, "identity");
+            assert!(final_page.force_create_new_workflow_task);
+            assert!(final_page.return_new_workflow_task);
+        }
+
         #[test]
         fn single_command_larger_than_a_page_is_not_split() {
             let max = 1024;
