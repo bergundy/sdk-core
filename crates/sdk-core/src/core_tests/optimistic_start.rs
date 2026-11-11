@@ -1641,3 +1641,267 @@ async fn closing_checkpoint_hands_off_and_cancels(
     );
     assert_eq!(meter.counter_total("optimistic_activity_dropped", &[]), 0);
 }
+
+/// The workflow cancels an optimistic activity lang hasn't received yet. Lang gets the cancel as
+/// soon as it receives the task.
+#[tokio::test]
+async fn cancel_before_lang_receives_task() {
+    let mut client = mock_worker_client();
+    client
+        .expect_cancel_activity_task()
+        .withf(|token, _| *token == TaskToken::from(b"real-1".to_vec()))
+        .times(1)
+        .returning(|_, _| Ok(RespondActivityTaskCanceledResponse::default()));
+    let (core, mut completions) = optimistic_worker(
+        history(Duration::from_secs(10)),
+        client,
+        Box::new(|_| RespondWorkflowTaskCompletedResponse {
+            optimistic_activity_tasks: vec![handed_off("act-1", b"real-1")],
+            ..Default::default()
+        }),
+    )
+    .await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    let run_id = act.run_id.clone();
+    core.complete_workflow_activation(completion(
+        &run_id,
+        vec![
+            speculative_activity(&core, 1),
+            speculative_timer(2, Duration::from_millis(10)),
+        ],
+        false,
+        true,
+    ))
+    .await
+    .unwrap();
+    let act = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(resolved_seq(&act), ["timer-2"]);
+    core.complete_workflow_activation(completion(&run_id, vec![cancel_activity(1)], false, true))
+        .await
+        .unwrap();
+    let act = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(resolved_seq(&act).as_slice(), [r] if r.contains("Cancelled"));
+    core.complete_workflow_activation(completion(&run_id, vec![], false, true))
+        .await
+        .unwrap();
+    let wtc = completions.recv().await.unwrap();
+    assert_eq!(
+        describe(&wtc.commands),
+        [
+            "schedule act-1 optimistic",
+            "timer 2 optimistic",
+            "fire 2",
+            "cancel 5"
+        ]
+    );
+    let (token, _) = poll_start(&core).await;
+    let cancel = tokio::time::timeout(Duration::from_secs(5), core.poll_activity_task())
+        .await
+        .expect("the cancel must reach lang")
+        .unwrap();
+    assert_eq!(cancel.task_token, token.clone().into_inner());
+    assert_matches!(cancel.variant, Some(activity_task::Variant::Cancel(_)));
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: token.into_inner(),
+        result: Some(ActivityExecutionResult::cancel_from_details(None)),
+    })
+    .await
+    .unwrap();
+    drain_pollers_and_shutdown(&core).await;
+}
+
+/// Lang's completion of an optimistic activity is held until its fate is known. When the server
+/// rejects the checkpoint while the outcome waits to be delivered, it's released right away.
+#[tokio::test]
+async fn held_completion_released_when_checkpoint_rejected() {
+    let (core, mut completions) = optimistic_worker_with(
+        history(Duration::from_secs(10)),
+        mock_worker_client(),
+        Box::new(|_| Err(tonic::Status::invalid_argument("UnhandledCommand"))),
+        |_| {},
+        optimistic_capabilities(),
+    )
+    .await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    let run_id = act.run_id.clone();
+    core.complete_workflow_activation(completion(
+        &run_id,
+        vec![
+            speculative_activity(&core, 1),
+            speculative_activity(&core, 2),
+        ],
+        false,
+        true,
+    ))
+    .await
+    .unwrap();
+    let (t1, _) = poll_start(&core).await;
+    let (t2, _) = poll_start(&core).await;
+    complete_activity(&core, &t2, 2).await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(resolved_seq(&act), ["act-2"]);
+    // Activity 1 finishes while lang works on activity 2's activation, so its outcome waits, and
+    // the workflow completes before it can be delivered
+    let held = complete_activity(&core, &t1, 1);
+    let rest = async {
+        core.complete_workflow_activation(completion(
+            &run_id,
+            vec![complete_workflow()],
+            true,
+            false,
+        ))
+        .await
+        .unwrap();
+        completions.recv().await.unwrap()
+    };
+    let (_, wtc) = tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(held, rest) })
+        .await
+        .expect("the held completion must be released");
+    assert_eq!(
+        describe(&wtc.commands),
+        [
+            "schedule act-1 optimistic",
+            "schedule act-2 optimistic",
+            "resolve 6 completed",
+            "complete"
+        ]
+    );
+    drain_pollers_and_shutdown(&core).await;
+}
+
+/// The run is evicted while the window is open and a completion the workflow can't observe is
+/// held. The eviction reports the window, and the held completion goes out after the handoff.
+#[tokio::test]
+async fn held_completion_released_when_run_evicted() {
+    let mut client = mock_worker_client();
+    client
+        .expect_complete_activity_task()
+        .withf(|token, _| *token == TaskToken::from(b"real-1".to_vec()))
+        .times(1)
+        .returning(|_, _| Ok(RespondActivityTaskCompletedResponse::default()));
+    let (core, mut completions) = optimistic_worker(
+        history(Duration::from_secs(10)),
+        client,
+        Box::new(|_| RespondWorkflowTaskCompletedResponse {
+            optimistic_activity_tasks: vec![handed_off("act-1", b"real-1")],
+            ..Default::default()
+        }),
+    )
+    .await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    let run_id = act.run_id.clone();
+    core.complete_workflow_activation(completion(
+        &run_id,
+        vec![
+            speculative_activity(&core, 1),
+            speculative_timer(2, Duration::from_millis(10)),
+            speculative_timer(3, Duration::from_secs(10)),
+        ],
+        false,
+        true,
+    ))
+    .await
+    .unwrap();
+    let (token, _) = poll_start(&core).await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(resolved_seq(&act), ["timer-2"]);
+    core.complete_workflow_activation(completion(&run_id, vec![cancel_activity(1)], false, true))
+        .await
+        .unwrap();
+    let act = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(resolved_seq(&act).as_slice(), [r] if r.contains("Cancelled"));
+    core.complete_workflow_activation(completion(&run_id, vec![], false, true))
+        .await
+        .unwrap();
+    let held = complete_activity(&core, &token, 1);
+    let rest = async {
+        core.request_workflow_eviction(&run_id);
+        let act = core.poll_workflow_activation().await.unwrap();
+        assert!(act.is_only_eviction());
+        core.complete_workflow_activation(WorkflowActivationCompletion::empty(&run_id))
+            .await
+            .unwrap();
+        completions.recv().await.unwrap()
+    };
+    let (_, wtc) = tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(held, rest) })
+        .await
+        .expect("the held completion must be released");
+    assert_eq!(
+        describe(&wtc.commands),
+        [
+            "schedule act-1 optimistic",
+            "timer 2 optimistic",
+            "timer 3 optimistic",
+            "fire 2",
+            "cancel 5"
+        ]
+    );
+    drain_pollers_and_shutdown(&core).await;
+}
+
+/// A completion held while the window waits on other optimistic work is released once the window
+/// checkpoints at its deadline, even when the worker is shutting down.
+#[tokio::test]
+async fn held_completion_released_at_shutdown() {
+    let mut client = mock_worker_client();
+    client
+        .expect_complete_activity_task()
+        .withf(|token, _| *token == TaskToken::from(b"real-1".to_vec()))
+        .times(1)
+        .returning(|_, _| Ok(RespondActivityTaskCompletedResponse::default()));
+    let (core, mut completions) = optimistic_worker(
+        history(Duration::from_secs(1)),
+        client,
+        Box::new(|_| RespondWorkflowTaskCompletedResponse {
+            optimistic_activity_tasks: vec![handed_off("act-1", b"real-1")],
+            ..Default::default()
+        }),
+    )
+    .await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    let run_id = act.run_id.clone();
+    core.complete_workflow_activation(completion(
+        &run_id,
+        vec![
+            speculative_activity(&core, 1),
+            speculative_timer(2, Duration::from_millis(10)),
+            speculative_timer(3, Duration::from_secs(10)),
+        ],
+        false,
+        true,
+    ))
+    .await
+    .unwrap();
+    let (token, _) = poll_start(&core).await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(resolved_seq(&act), ["timer-2"]);
+    // The workflow stops waiting for activity 1, so its outcome can't be observed, while timer 3
+    // keeps the window open
+    core.complete_workflow_activation(completion(&run_id, vec![cancel_activity(1)], false, true))
+        .await
+        .unwrap();
+    let act = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(resolved_seq(&act).as_slice(), [r] if r.contains("Cancelled"));
+    core.complete_workflow_activation(completion(&run_id, vec![], false, true))
+        .await
+        .unwrap();
+    let poller = idle_workflow_poller(core.clone());
+    core.initiate_shutdown();
+    let held = complete_activity(&core, &token, 1);
+    let (_, wtc) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(held, completions.recv())
+    })
+    .await
+    .expect("the held completion must be released");
+    assert_eq!(
+        describe(&wtc.unwrap().commands),
+        [
+            "schedule act-1 optimistic",
+            "timer 2 optimistic",
+            "timer 3 optimistic",
+            "fire 2",
+            "cancel 5"
+        ]
+    );
+    shutdown_with_poller(core, poller).await;
+}
