@@ -65,6 +65,10 @@ struct Entry {
     started_at: Instant,
     /// Set if the checkpoint that handed the activity off also closed the workflow.
     workflow_closed: bool,
+    /// Set once the workflow asked to cancel the activity.
+    cancel_requested: bool,
+    /// Set once lang reported an outcome, after which there's nothing left to cancel.
+    outcome_reported: bool,
     fate: watch::Sender<Fate>,
     heartbeat_details: Option<Vec<temporalio_common::protos::temporal::api::common::v1::Payload>>,
 }
@@ -143,6 +147,8 @@ impl OptimisticActivities {
                 activity_type: task.activity_type.clone().unwrap_or_default().name,
                 started_at: Instant::now(),
                 workflow_closed: false,
+                cancel_requested: false,
+                outcome_reported: false,
                 fate: watch::Sender::new(Fate::InWindow),
                 heartbeat_details: None,
             },
@@ -166,10 +172,11 @@ impl OptimisticActivities {
         status: activity_execution_result::Status,
     ) {
         let (run_id, generation, seq) = {
-            let inner = self.inner.lock();
-            let Some(e) = inner.by_token.get(token) else {
+            let mut inner = self.inner.lock();
+            let Some(e) = inner.by_token.get_mut(token) else {
                 return;
             };
+            e.outcome_reported = true;
             if *e.fate.borrow() != Fate::InWindow {
                 return;
             }
@@ -263,7 +270,7 @@ impl OptimisticActivities {
                         real_tokens.push((real, token.clone()));
                         handoff.handed_off.push(e.activity_type.clone());
                         handed_off_tokens.push((token.clone(), e.started_at));
-                        if workflow_closed {
+                        if workflow_closed && !e.outcome_reported {
                             to_cancel.push(token.clone());
                         }
                     }
@@ -307,17 +314,39 @@ impl OptimisticActivities {
     }
 
     /// Asks lang to cancel a local execution on the workflow's request.
+    /// If lang hasn't received the task yet, the cancel is issued once it does.
     pub(crate) fn cancel(&self, run_id: &str, generation: u64, seq: u32) {
         let token = self
             .inner
             .lock()
             .by_token
-            .iter()
+            .iter_mut()
             .find(|(_, e)| e.run_id == run_id && e.generation == generation && e.seq == seq)
-            .map(|(t, _)| t.clone());
+            .filter(|(_, e)| !e.outcome_reported)
+            .map(|(t, e)| {
+                e.cancel_requested = true;
+                t.clone()
+            });
         if let Some(token) = token {
             self.cancel_all([token]);
         }
+    }
+
+    /// Discards every activity still in a window, ex: because workflow processing stopped, so
+    /// nothing waits on their fate forever. Returns their activity types.
+    pub(crate) fn drop_all(&self) -> Vec<String> {
+        let run_ids: Vec<_> = self
+            .inner
+            .lock()
+            .by_token
+            .values()
+            .filter(|e| *e.fate.borrow() == Fate::InWindow)
+            .map(|e| e.run_id.clone())
+            .collect();
+        run_ids
+            .into_iter()
+            .flat_map(|run_id| self.drop_run(&run_id))
+            .collect()
     }
 
     fn cancel_all(&self, tokens: impl IntoIterator<Item = TaskToken>) {
@@ -331,15 +360,15 @@ impl OptimisticActivities {
     /// True if the local execution of an optimistic activity must be cancelled as soon as lang
     /// receives it, because its window was discarded or its workflow closed before then.
     pub(crate) fn cancel_on_dispatch(&self, token: &TaskToken) -> bool {
-        self.inner
-            .lock()
-            .by_token
-            .get(token)
-            .is_some_and(|e| match *e.fate.borrow() {
-                Fate::Dropped => true,
-                Fate::HandedOff(_) => e.workflow_closed,
-                Fate::InWindow | Fate::Observed => false,
-            })
+        self.inner.lock().by_token.get(token).is_some_and(|e| {
+            !e.outcome_reported
+                && (e.cancel_requested
+                    || match *e.fate.borrow() {
+                        Fate::Dropped => true,
+                        Fate::HandedOff(_) => e.workflow_closed,
+                        Fate::InWindow | Fate::Observed => false,
+                    })
+        })
     }
 
     /// True if the activity was handed off by a checkpoint that also closed its workflow.

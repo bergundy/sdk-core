@@ -252,6 +252,7 @@ impl Workflows {
         let (start_polling_tx, start_polling_rx) = oneshot::channel();
         // We must spawn a task to constantly poll the activation stream, because otherwise
         // activation completions would not cause anything to happen until the next poll.
+        let stream_registry = optimistic_activities.clone();
         let processing_task = thread::Builder::new()
             .name("workflow-processing".to_string())
             .spawn(move || {
@@ -305,6 +306,11 @@ impl Workflows {
                                 });
                             }
                         }
+                    }
+                    // No window can be checkpointed anymore, and lang's completions of their
+                    // activities must not wait for it.
+                    if let Some(registry) = stream_registry {
+                        registry.drop_all();
                     }
                 });
             })
