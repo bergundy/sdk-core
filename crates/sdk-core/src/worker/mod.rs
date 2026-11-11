@@ -1404,6 +1404,15 @@ impl Worker {
         r
     }
 
+    /// Cancels an activity the way a worker control cancel command from the server does.
+    #[cfg(test)]
+    pub(crate) fn cancel_activity_from_server(&self, task_token: TaskToken) -> bool {
+        self.task_subsystems
+            .at_task_mgr
+            .as_ref()
+            .is_some_and(|atm| atm.cancel_activity_callback()(task_token))
+    }
+
     /// Notify the Temporal service that an activity is still alive. Long running activities that
     /// take longer than `activity_heartbeat_timeout` to finish must call this function in order to
     /// report progress, otherwise the activity will timeout and a new attempt will be scheduled.
