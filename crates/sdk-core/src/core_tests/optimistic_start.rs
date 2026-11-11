@@ -1549,3 +1549,95 @@ async fn server_cancel_reaches_handed_off_activity(
     .unwrap();
     shutdown_with_poller(core, poller).await;
 }
+
+/// When the checkpoint also closes the workflow, the server still takes over running optimistic
+/// activities. Nothing can observe them anymore, so Core cancels their local executions, but keeps
+/// their tokens mapped: heartbeats and worker control commands still reach them, and their
+/// outcome is reported with the server's token, which is expected to be gone by then.
+#[rstest::rstest]
+#[tokio::test]
+async fn closing_checkpoint_hands_off_and_cancels(
+    #[values(true, false)] polled_before_checkpoint: bool,
+) {
+    let real = TaskToken::from(b"real-1".to_vec());
+    let mut client = mock_worker_client();
+    let r = real.clone();
+    client
+        .expect_record_activity_heartbeat()
+        .withf(move |token, _| *token == r)
+        .times(1..)
+        .returning(|_, _| Ok(RecordActivityTaskHeartbeatResponse::default()));
+    let r = real.clone();
+    client
+        .expect_cancel_activity_task()
+        .withf(move |token, _| *token == r)
+        .times(1)
+        .returning(|_, _| Err(tonic::Status::not_found("workflow closed")));
+    let (core, mut completions, meter) = optimistic_worker_metered(
+        history(Duration::from_secs(10)),
+        client,
+        Box::new(|_| RespondWorkflowTaskCompletedResponse {
+            optimistic_activity_tasks: vec![handed_off("act-1", b"real-1")],
+            ..Default::default()
+        }),
+    )
+    .await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    let run_id = act.run_id.clone();
+    core.complete_workflow_activation(completion(
+        &run_id,
+        vec![
+            speculative_activity(&core, 1),
+            speculative_timer(2, Duration::from_millis(10)),
+        ],
+        false,
+        true,
+    ))
+    .await
+    .unwrap();
+    let early_token = if polled_before_checkpoint {
+        Some(poll_start(&core).await.0)
+    } else {
+        None
+    };
+    let act = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(resolved_seq(&act), ["timer-2"]);
+    core.complete_workflow_activation(completion(&run_id, vec![complete_workflow()], true, false))
+        .await
+        .unwrap();
+    let wtc = completions.recv().await.unwrap();
+    assert_eq!(
+        describe(&wtc.commands),
+        [
+            "schedule act-1 optimistic",
+            "timer 2 optimistic",
+            "fire 2",
+            "complete"
+        ]
+    );
+    let token = match early_token {
+        Some(t) => t,
+        None => poll_start(&core).await.0,
+    };
+    let cancel = core.poll_activity_task().await.unwrap();
+    assert_eq!(cancel.task_token, token.clone().into_inner());
+    assert_matches!(cancel.variant, Some(activity_task::Variant::Cancel(_)));
+    // The mapping is kept: the server's token still finds the local execution
+    core.record_activity_heartbeat(ActivityHeartbeat {
+        task_token: token.clone().into_inner(),
+        details: vec![],
+    });
+    assert!(core.cancel_activity_from_server(real.clone()));
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: token.into_inner(),
+        result: Some(ActivityExecutionResult::cancel_from_details(None)),
+    })
+    .await
+    .unwrap();
+    drain_pollers_and_shutdown(&core).await;
+    assert_eq!(
+        meter.counter_total("optimistic_activity_handed_off", &[]),
+        1
+    );
+    assert_eq!(meter.counter_total("optimistic_activity_dropped", &[]), 0);
+}
