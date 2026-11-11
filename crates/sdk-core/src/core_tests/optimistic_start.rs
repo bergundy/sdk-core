@@ -22,7 +22,7 @@ use temporalio_common::protos::{
     coresdk::{
         ActivityTaskCompletion, AsJsonPayloadExt, IntoPayloadsExt,
         activity_result::{ActivityExecutionResult, activity_resolution},
-        activity_task::{ActivityTask, activity_task},
+        activity_task::{ActivityCancelReason, ActivityTask, Cancel, activity_task},
         workflow_activation::{WorkflowActivation, workflow_activation_job},
         workflow_commands::{
             ActivityCancellationType, CancelTimer, CompleteWorkflowExecution,
@@ -1373,4 +1373,179 @@ async fn metrics_count_fallbacks() {
     );
     assert_eq!(meter.counter_total("optimistic_activity_started", &[]), 0);
     assert_eq!(meter.counter_total("speculation_window_checkpoint", &[]), 0);
+}
+
+fn activity_with_timeouts(
+    core: &Worker,
+    seq: u32,
+    start_to_close: Duration,
+    heartbeat: Option<Duration>,
+) -> workflow_command::Variant {
+    let mut cmd = speculative_activity(core, seq);
+    if let workflow_command::Variant::ScheduleActivity(a) = &mut cmd {
+        a.start_to_close_timeout = Some(start_to_close.try_into().unwrap());
+        a.heartbeat_timeout = heartbeat.map(|h| h.try_into().unwrap());
+    }
+    cmd
+}
+
+/// A handed off activity is cancelled locally when the server would time it out: its
+/// start-to-close timeout counts from the optimistic start, and its heartbeat timeout from the
+/// handoff.
+#[rstest::rstest]
+#[case::start_to_close(Duration::from_secs(10), Duration::from_millis(700), None)]
+#[case::heartbeat(
+    Duration::from_secs(1),
+    Duration::from_secs(10),
+    Some(Duration::from_millis(300))
+)]
+#[tokio::test]
+async fn handoff_arms_local_timeouts(
+    #[case] wft_timeout: Duration,
+    #[case] start_to_close: Duration,
+    #[case] heartbeat: Option<Duration>,
+) {
+    let (core, mut completions) = optimistic_worker_with(
+        history(wft_timeout),
+        mock_worker_client(),
+        Box::new(|_| {
+            Ok(RespondWorkflowTaskCompletedResponse {
+                optimistic_activity_tasks: vec![handed_off("act-1", b"real-1")],
+                ..Default::default()
+            })
+        }),
+        |mock| mock.worker_cfg(|wc| wc.local_timeout_buffer_for_activities = Duration::ZERO),
+        optimistic_capabilities(),
+    )
+    .await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(completion(
+        &act.run_id,
+        vec![activity_with_timeouts(&core, 1, start_to_close, heartbeat)],
+        false,
+        true,
+    ))
+    .await
+    .unwrap();
+    let poller = idle_workflow_poller(core.clone());
+    let (token, _) = poll_start(&core).await;
+    let started = std::time::Instant::now();
+    // The local timeout only starts with the handoff, at the checkpoint
+    let (wtc, cancel) = tokio::join!(completions.recv(), core.poll_activity_task());
+    let checkpointed = describe(&wtc.unwrap().commands);
+    let cancel = cancel.unwrap();
+    assert_eq!(checkpointed, ["schedule act-1 optimistic"]);
+    assert_eq!(cancel.task_token, token.clone().into_inner());
+    assert_matches!(
+        cancel.variant,
+        Some(activity_task::Variant::Cancel(Cancel { reason, .. }))
+            if reason == ActivityCancelReason::TimedOut as i32
+    );
+    let elapsed = started.elapsed();
+    match heartbeat {
+        Some(hb) => assert!(elapsed >= wft_timeout.mul_f32(0.8) + hb, "{elapsed:?}"),
+        None => assert!(elapsed >= start_to_close, "{elapsed:?}"),
+    }
+    // The server already timed it out, so the outcome isn't reported
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: token.into_inner(),
+        result: Some(ActivityExecutionResult::cancel_from_details(None)),
+    })
+    .await
+    .unwrap();
+    shutdown_with_poller(core, poller).await;
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ServerCancel {
+    HeartbeatCancelRequested,
+    HeartbeatNotFound,
+    WorkerCommand,
+}
+
+/// Cancellations the server sends for a handed off activity name it by the server's token, and
+/// must reach the local execution, which only knows the made up one.
+#[rstest::rstest]
+#[tokio::test]
+async fn server_cancel_reaches_handed_off_activity(
+    #[values(
+        ServerCancel::HeartbeatCancelRequested,
+        ServerCancel::HeartbeatNotFound,
+        ServerCancel::WorkerCommand
+    )]
+    how: ServerCancel,
+) {
+    let real = TaskToken::from(b"real-1".to_vec());
+    let mut client = mock_worker_client();
+    let real_for_hb = real.clone();
+    client
+        .expect_record_activity_heartbeat()
+        .withf(move |token, _| *token == real_for_hb)
+        .returning(move |_, _| match how {
+            ServerCancel::HeartbeatNotFound => Err(tonic::Status::not_found("gone")),
+            ServerCancel::HeartbeatCancelRequested => Ok(RecordActivityTaskHeartbeatResponse {
+                cancel_requested: true,
+                ..Default::default()
+            }),
+            ServerCancel::WorkerCommand => Ok(RecordActivityTaskHeartbeatResponse::default()),
+        });
+    let real_for_cancel = real.clone();
+    client
+        .expect_cancel_activity_task()
+        .withf(move |token, _| *token == real_for_cancel)
+        .times(match how {
+            ServerCancel::HeartbeatNotFound => 0,
+            _ => 1,
+        })
+        .returning(|_, _| Ok(RespondActivityTaskCanceledResponse::default()));
+    let (core, mut completions) = optimistic_worker(
+        history(Duration::from_secs(1)),
+        client,
+        Box::new(|_| RespondWorkflowTaskCompletedResponse {
+            optimistic_activity_tasks: vec![handed_off("act-1", b"real-1")],
+            ..Default::default()
+        }),
+    )
+    .await;
+    let act = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(completion(
+        &act.run_id,
+        vec![speculative_activity(&core, 1)],
+        false,
+        true,
+    ))
+    .await
+    .unwrap();
+    let poller = idle_workflow_poller(core.clone());
+    let (token, _) = poll_start(&core).await;
+    completions.recv().await.unwrap();
+    let trigger = async {
+        loop {
+            match how {
+                ServerCancel::WorkerCommand => {
+                    if core.cancel_activity_from_server(real.clone()) {
+                        break;
+                    }
+                }
+                _ => core.record_activity_heartbeat(ActivityHeartbeat {
+                    task_token: token.clone().into_inner(),
+                    details: vec![],
+                }),
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let cancel = tokio::select! {
+        cancel = core.poll_activity_task() => cancel.unwrap(),
+        _ = trigger => core.poll_activity_task().await.unwrap(),
+    };
+    assert_eq!(cancel.task_token, token.clone().into_inner());
+    assert_matches!(cancel.variant, Some(activity_task::Variant::Cancel(_)));
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: token.into_inner(),
+        result: Some(ActivityExecutionResult::cancel_from_details(None)),
+    })
+    .await
+    .unwrap();
+    shutdown_with_poller(core, poller).await;
 }

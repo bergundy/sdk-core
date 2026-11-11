@@ -40,7 +40,9 @@ relevant information.
   capability. Their outcomes reach the workflow within the same workflow task, and history gets
   ordinary activity and timer events. Lang reports block exits with `speculative_block_exited`
   and `speculative_block_active` on activation completions. Large batches go out as paginated
-  workflow task completions when the namespace supports them.
+  workflow task completions when the namespace supports them. Once the server takes over a still
+  running optimistic activity, it gets the same local timeouts as a polled one, and server
+  cancellations reach it.
 * Metrics for optimistic start. All carry the worker's usual `namespace`, `task_queue` and
   `workflow_type` attributes:
   * `optimistic_activity_started` (counter, `activity_type`): activities started optimistically.

@@ -115,6 +115,8 @@ struct RemoteInFlightActInfo {
     base: InFlightActInfo,
     /// Used to calculate aggregation delay between activity heartbeats.
     heartbeat_timeout: Option<prost_types::Duration>,
+    /// The shorter of the start-to-close and schedule-to-close timeouts, if any.
+    close_timeout: Option<Duration>,
     /// Set if we have already issued a cancellation activation to lang for this activity, with
     /// the original reason we issued the cancel.
     issued_cancel_to_lang: Option<ActivityCancelReason>,
@@ -147,6 +149,15 @@ impl RemoteInFlightActInfo {
                 scheduled_time: poll_resp.scheduled_time.and_then(|i| i.try_into().ok()),
             },
             heartbeat_timeout: poll_resp.heartbeat_timeout,
+            close_timeout: [
+                poll_resp.start_to_close_timeout,
+                poll_resp.schedule_to_close_timeout,
+            ]
+            .into_iter()
+            .flatten()
+            .filter_map(|d| Duration::try_from(d).ok())
+            .filter(|d| !d.is_zero())
+            .min(),
             issued_cancel_to_lang: None,
             known_not_found: false,
             local_timeouts_task: None,
@@ -242,6 +253,19 @@ impl WorkerActivityTasks {
             |_: &mut ()| PollNext::Left,
         );
 
+        {
+            let outstanding = outstanding_activity_tasks.clone();
+            let cancels_tx = cancels_tx.clone();
+            optimistic.set_handoff_callback(move |token, started_at| {
+                arm_handoff_timeouts(
+                    &outstanding,
+                    &cancels_tx,
+                    token,
+                    started_at,
+                    local_timeout_buffer,
+                );
+            });
+        }
         let activity_task_stream = ActivityTaskStream {
             source_stream,
             outstanding_tasks: outstanding_activity_tasks.clone(),
@@ -687,7 +711,14 @@ impl WorkerActivityTasks {
     pub(crate) fn cancel_activity_callback(&self) -> CancelActivityCallback {
         let outstanding = self.outstanding_activity_tasks.clone();
         let cancels_tx = self.cancels_tx.clone();
+        let optimistic = self.optimistic.clone();
         Arc::new(move |task_token: TaskToken| {
+            // The server names a handed off optimistic activity by its own token
+            let task_token = if outstanding.lock().contains_key(&task_token) {
+                task_token
+            } else {
+                optimistic.synthetic_for(&task_token).unwrap_or(task_token)
+            };
             if outstanding.lock().contains_key(&task_token) {
                 let _ = cancels_tx.send(PendingActivityCancel::new(
                     task_token,
@@ -818,8 +849,7 @@ where
 
                             // The window of an optimistic activity may be discarded before lang
                             // receives it, in which case the cancel couldn't be issued earlier.
-                            if tt.is_optimistic_activity_task() && self.optimistic.is_dropped(&tt)
-                            {
+                            if tt.is_optimistic_activity_task() && self.optimistic.is_dropped(&tt) {
                                 let _ = cancels_tx.send(PendingActivityCancel::new(
                                     tt.clone(),
                                     ActivityCancelReason::Cancelled,
@@ -847,41 +877,30 @@ where
                                 // activities can still get cleaned up even if the user isn't
                                 // heartbeating. Schedule to closed is not tracked due to the
                                 // possibility of clock skew messing things up, and it's relative
-                                // unlikeliness compared to the other timeouts. Optimistic
-                                // activities are handed off by their deadlines instead, and
-                                // their heartbeat timeout only counts from the handoff.
+                                // unlikeliness compared to the other timeouts.
                                 if let Some(timers) = ActivityLocalTimers::new(
                                     task.resp.heartbeat_timeout,
                                     task.resp.start_to_close_timeout,
                                     self.local_timeout_buffer,
                                 ) {
-                                    let resetter = timers.heartbeat_resetter();
-                                    let cancel_tx = cancels_tx.clone();
-                                    let task_token = tt.clone();
-                                    let local_timeouts_task =
-                                        Some(tokio::task::spawn(async move {
-                                            let timeout_type = timers.run().await;
-                                            debug!(
-                                                task_token=%task_token,
-                                                "Timing out activity due to elapsed local {timeout_type} timer",
-                                            );
-                                            let _ = cancel_tx.send(PendingActivityCancel::new(
-                                                task_token,
-                                                ActivityCancelReason::TimedOut,
-                                                ActivityCancellationDetails {
-                                                    is_not_found: true,
-                                                    is_timed_out: true,
-                                                    ..Default::default()
-                                                },
-                                            ));
-                                        }));
-                                    if let Some(outstanding_info) =
-                                        self.outstanding_tasks.lock().get_mut(&tt)
-                                    {
-                                        outstanding_info.local_timeouts_task = local_timeouts_task;
-                                        outstanding_info.timeout_resetter = resetter;
-                                    }
+                                    arm_local_timeouts(
+                                        &self.outstanding_tasks,
+                                        &cancels_tx,
+                                        &tt,
+                                        timers,
+                                    );
                                 }
+                            } else if let Some(started_at) = self.optimistic.handed_off_start(&tt) {
+                                // Optimistic activities only get local timeouts once the server
+                                // owns them, since their heartbeat timeout counts from the
+                                // handoff. The handoff may have happened before lang got the task.
+                                arm_handoff_timeouts(
+                                    &self.outstanding_tasks,
+                                    &cancels_tx,
+                                    &tt,
+                                    started_at,
+                                    self.local_timeout_buffer,
+                                );
                             }
 
                             ActivityTask::start_from_poll_resp(task.resp)
@@ -1070,6 +1089,68 @@ impl std::fmt::Display for ActivityLocalTimeoutKind {
 ///
 /// Construction returns [`None`] when both timeouts are unset, so the
 /// caller knows not to spawn a local-timeouts task at all.
+/// Spawns the local timeouts for an outstanding activity, unless it already has them.
+fn arm_local_timeouts(
+    outstanding: &OutstandingActMap,
+    cancels_tx: &UnboundedSender<PendingActivityCancel>,
+    task_token: &TaskToken,
+    timers: ActivityLocalTimers,
+) {
+    let mut outstanding = outstanding.lock();
+    let Some(info) = outstanding.get_mut(task_token) else {
+        return;
+    };
+    if info.local_timeouts_task.is_some() {
+        return;
+    }
+    let resetter = timers.heartbeat_resetter();
+    let cancel_tx = cancels_tx.clone();
+    let task_token = task_token.clone();
+    info.local_timeouts_task = Some(tokio::task::spawn(async move {
+        let timeout_type = timers.run().await;
+        debug!(
+            task_token=%task_token,
+            "Timing out activity due to elapsed local {timeout_type} timer",
+        );
+        let _ = cancel_tx.send(PendingActivityCancel::new(
+            task_token,
+            ActivityCancelReason::TimedOut,
+            ActivityCancellationDetails {
+                is_not_found: true,
+                is_timed_out: true,
+                ..Default::default()
+            },
+        ));
+    }));
+    info.timeout_resetter = resetter;
+}
+
+/// Spawns the local timeouts of an optimistic activity the server took over. Its start-to-close
+/// and schedule-to-close timeouts count from its optimistic start, which is also when it was
+/// scheduled, while its heartbeat timeout counts from now.
+fn arm_handoff_timeouts(
+    outstanding: &OutstandingActMap,
+    cancels_tx: &UnboundedSender<PendingActivityCancel>,
+    task_token: &TaskToken,
+    started_at: Instant,
+    local_timeout_buffer: Duration,
+) {
+    let timers = {
+        let outstanding = outstanding.lock();
+        let Some(info) = outstanding.get(task_token) else {
+            return;
+        };
+        ActivityLocalTimers::after_handoff(
+            info.heartbeat_timeout,
+            info.close_timeout.map(|d| started_at + d),
+            local_timeout_buffer,
+        )
+    };
+    if let Some(timers) = timers {
+        arm_local_timeouts(outstanding, cancels_tx, task_token, timers);
+    }
+}
+
 struct ActivityLocalTimers {
     heartbeat: Option<(Duration, Arc<Notify>)>,
     start_to_close: Option<Duration>,
@@ -1098,6 +1179,22 @@ impl ActivityLocalTimers {
             heartbeat: heartbeat.map(|d| (d, Arc::new(Notify::new()))),
             start_to_close,
         })
+    }
+
+    /// Timers for an optimistic activity handed off to the server, which must close by
+    /// `close_deadline`.
+    fn after_handoff(
+        heartbeat: Option<prost_types::Duration>,
+        close_deadline: Option<Instant>,
+        local_timeout_buffer: Duration,
+    ) -> Option<Self> {
+        let mut timers = Self::new(heartbeat, None, local_timeout_buffer).unwrap_or(Self {
+            heartbeat: None,
+            start_to_close: None,
+        });
+        timers.start_to_close = close_deadline
+            .map(|d| d.saturating_duration_since(Instant::now()) + local_timeout_buffer);
+        (timers.heartbeat.is_some() || timers.start_to_close.is_some()).then_some(timers)
     }
 
     /// A clone of the [`Notify`] that resets the heartbeat timer, for the
