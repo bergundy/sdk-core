@@ -35,9 +35,9 @@ pub(crate) trait OptimisticEnv: Send + Sync {
     /// capability and this worker runs activities.
     fn enabled(&self) -> bool;
     fn now(&self) -> Instant;
-    /// Reserves `n` activity slots for optimistic starts. Reserves nothing and returns false if
-    /// they are not all available.
-    fn reserve_activity_slots(&self, n: usize) -> bool;
+    /// Reserves `n` activity slots for optimistic starts. Reserves nothing if they are not all
+    /// available.
+    fn reserve_activity_slots(&self, n: usize) -> Result<(), FallbackReason>;
     /// Releases slots reserved by [Self::reserve_activity_slots] that weren't used.
     fn release_reserved_slots(&self);
     /// Dispatches an activity to the local activity worker using a reserved slot. The task token
@@ -57,8 +57,47 @@ pub(crate) trait OptimisticEnv: Send + Sync {
     /// await their handoff.
     fn window_closed(&self, run_id: &str, generation: u64);
     /// The window's work is discarded, ex: because its workflow task failed. Local executions
-    /// are cancelled and their outcomes dropped.
-    fn window_dropped(&self, run_id: &str);
+    /// are cancelled and their outcomes dropped. Returns the types of the activities dropped.
+    fn window_dropped(&self, run_id: &str) -> Vec<String>;
+}
+
+/// Why speculative commands were sent as normal commands instead of starting optimistically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FallbackReason {
+    /// The namespace doesn't have the optimistic start capability.
+    Capability,
+    /// An activity is on a task queue other than the workflow's.
+    TaskQueue,
+    /// Not enough free activity slots.
+    NoSlot,
+    /// The task queue has an activity rate limit, which optimistic starts would bypass.
+    RateLimited,
+    /// This worker doesn't run activities.
+    NoActivityWorker,
+    /// Too little of the workflow task's time is left, or an activity's timeouts are too short.
+    WindowTime,
+    /// Local activities are running.
+    LocalActivities,
+    /// Something else in the workflow task's commands can't be part of an optimistic log.
+    NonDeferrableBatch,
+    /// The window is already being checkpointed.
+    WindowClosing,
+}
+
+impl FallbackReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            FallbackReason::Capability => "capability",
+            FallbackReason::TaskQueue => "task_queue",
+            FallbackReason::NoSlot => "no_slot",
+            FallbackReason::RateLimited => "rate_limited",
+            FallbackReason::NoActivityWorker => "no_activity_worker",
+            FallbackReason::WindowTime => "window_time",
+            FallbackReason::LocalActivities => "local_activities",
+            FallbackReason::NonDeferrableBatch => "non_deferrable_batch",
+            FallbackReason::WindowClosing => "window_closing",
+        }
+    }
 }
 
 /// An activity started optimistically, to be dispatched to the local activity worker.
@@ -99,7 +138,7 @@ pub(crate) enum OptimisticResultKind {
 /// processing thread's runtime.
 pub(crate) struct OptimisticRuntime {
     capabilities: Arc<NamespaceCapabilities>,
-    activities: Option<ActivitiesFromWFTsHandle>,
+    activities: Result<ActivitiesFromWFTsHandle, FallbackReason>,
     registry: Arc<OptimisticActivities>,
     local_tx: UnboundedSender<LocalInput>,
     reserved: Mutex<Vec<TrackedOwnedMeteredSemPermit<ActivitySlotKind>>>,
@@ -108,9 +147,10 @@ pub(crate) struct OptimisticRuntime {
 }
 
 impl OptimisticRuntime {
+    /// `activities` is the handle to dispatch optimistic activities with, or why there is none.
     pub(super) fn new(
         capabilities: Arc<NamespaceCapabilities>,
-        activities: Option<ActivitiesFromWFTsHandle>,
+        activities: Result<ActivitiesFromWFTsHandle, FallbackReason>,
         registry: Arc<OptimisticActivities>,
         local_tx: UnboundedSender<LocalInput>,
     ) -> Self {
@@ -176,19 +216,14 @@ impl OptimisticEnv for OptimisticRuntime {
         Instant::now()
     }
 
-    fn reserve_activity_slots(&self, n: usize) -> bool {
-        let Some(handle) = self.activities.as_ref() else {
-            return false;
-        };
+    fn reserve_activity_slots(&self, n: usize) -> Result<(), FallbackReason> {
+        let handle = self.activities.as_ref().map_err(|r| *r)?;
         let mut permits = Vec::with_capacity(n);
         for _ in 0..n {
-            match handle.reserve_slot() {
-                Some(p) => permits.push(p),
-                None => return false,
-            }
+            permits.push(handle.reserve_slot().ok_or(FallbackReason::NoSlot)?);
         }
         self.reserved.lock().extend(permits);
-        true
+        Ok(())
     }
 
     fn release_reserved_slots(&self) {
@@ -196,7 +231,7 @@ impl OptimisticEnv for OptimisticRuntime {
     }
 
     fn start_activity(&self, start: OptimisticActivityStart) {
-        let (Some(handle), Some(permit)) = (self.activities.as_ref(), self.reserved.lock().pop())
+        let (Ok(handle), Some(permit)) = (self.activities.as_ref(), self.reserved.lock().pop())
         else {
             dbg_panic!("Optimistic activity started without a reserved slot");
             return;
@@ -257,8 +292,8 @@ impl OptimisticEnv for OptimisticRuntime {
         self.stop_timers(run_id);
     }
 
-    fn window_dropped(&self, run_id: &str) {
+    fn window_dropped(&self, run_id: &str) -> Vec<String> {
         self.stop_timers(run_id);
-        self.registry.drop_run(run_id);
+        self.registry.drop_run(run_id)
     }
 }
