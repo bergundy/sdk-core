@@ -12,6 +12,10 @@ use super::{CommandAndMachine, MachineKey, WorkflowMachines};
 use crate::{
     abstractions::dbg_panic,
     protosext::HistoryEventExt,
+    telemetry::metrics::{
+        activity_type as metric_activity_type, checkpoint_reason, fallback_reason,
+        optimistic_outcome,
+    },
     worker::workflow::{
         CommandID, WFMachinesError, fatal,
         machines::{
@@ -20,7 +24,8 @@ use crate::{
         },
         nondeterminism,
         optimistic::{
-            OptimisticActivityStart, OptimisticEnv, OptimisticResult, OptimisticResultKind,
+            FallbackReason, OptimisticActivityStart, OptimisticEnv, OptimisticResult,
+            OptimisticResultKind,
         },
     },
 };
@@ -90,7 +95,12 @@ struct Window {
     checkpoint: Option<CheckpointReason>,
     /// Outcomes that arrived but haven't been delivered yet, in arrival order.
     queued: VecDeque<QueuedOutcome>,
+    /// When the window must checkpoint: the earlier of `wft_deadline` and the time running
+    /// optimistic activities must be handed off by for the server to enforce their timeouts.
     deadline: Instant,
+    /// 80% of the workflow task timeout.
+    wft_deadline: Instant,
+    opened_at: Instant,
 }
 
 struct QueuedOutcome {
@@ -109,11 +119,39 @@ enum OptimisticOutcome {
 pub(crate) enum CheckpointReason {
     BlockExit,
     NonDeferrableCommand,
+    /// A speculative command couldn't start optimistically and went out as a normal command.
+    IneligibleCommand,
+    WorkflowCompletion,
     LocalActivity,
+    /// 80% of the workflow task timeout elapsed.
     Deadline,
+    /// A running optimistic activity reached its start-to-close or schedule-to-close deadline.
+    ActivityTimeout,
+    /// An optimistic activity failed, asked to complete asynchronously, or was cancelled without
+    /// the workflow asking, while the workflow waited on it.
     UnobservedOutcome,
     QueryResponse,
     Eviction,
+    /// Nothing the workflow waits on is in flight anymore.
+    Idle,
+}
+
+impl CheckpointReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            CheckpointReason::BlockExit => "block_exit",
+            CheckpointReason::NonDeferrableCommand => "non_deferrable_command",
+            CheckpointReason::IneligibleCommand => "ineligible_command",
+            CheckpointReason::WorkflowCompletion => "workflow_completion",
+            CheckpointReason::LocalActivity => "local_activity",
+            CheckpointReason::Deadline => "deadline",
+            CheckpointReason::ActivityTimeout => "activity_timeout",
+            CheckpointReason::UnobservedOutcome => "activity_failed",
+            CheckpointReason::QueryResponse => "query",
+            CheckpointReason::Eviction => "eviction",
+            CheckpointReason::Idle => "idle",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,9 +231,24 @@ impl WorkflowMachines {
 
     /// Must be called once the completion carrying the current window's log was reported.
     pub(crate) fn optimistic_window_reported(&mut self) {
-        if let Some(w) = self.optimistic.window.take()
-            && let Some(env) = self.optimistic.env.as_ref()
-        {
+        let Some(w) = self.optimistic.window.take() else {
+            return;
+        };
+        let timers_handed_off = self
+            .optimistic
+            .timers
+            .values()
+            .filter(|mk| matches!(self.machine(**mk), Machines::TimerMachine(m) if m.awaiting_optimistic_fire()))
+            .count();
+        self.metrics
+            .optimistic_timer_handed_off(timers_handed_off as u64);
+        let reason = w.checkpoint.unwrap_or(CheckpointReason::Idle);
+        self.metrics
+            .with_new_attrs([checkpoint_reason(reason.as_str())])
+            .speculation_window_checkpoint();
+        self.metrics
+            .speculation_window_duration(w.opened_at.elapsed());
+        if let Some(env) = self.optimistic.env.as_ref() {
             env.window_closed(&self.run_id, w.generation);
         }
     }
@@ -203,10 +256,17 @@ impl WorkflowMachines {
     /// Discards the current window, ex: because the workflow task failed or the run is being
     /// evicted. Its log is never sent.
     pub(crate) fn drop_optimistic_window(&mut self) {
-        if self.optimistic.window.take().is_some()
-            && let Some(env) = self.optimistic.env.as_ref()
-        {
-            env.window_dropped(&self.run_id);
+        let Some(w) = self.optimistic.window.take() else {
+            return;
+        };
+        self.metrics
+            .speculation_window_duration(w.opened_at.elapsed());
+        if let Some(env) = self.optimistic.env.as_ref() {
+            for activity_type in env.window_dropped(&self.run_id) {
+                self.metrics
+                    .with_new_attrs([metric_activity_type(activity_type)])
+                    .optimistic_activity_dropped();
+            }
         }
     }
 
@@ -506,79 +566,28 @@ impl WorkflowMachines {
     // ---------------------------------------------------------------------------------------
 
     fn start_optimistic_commands(&mut self, first_new: usize) -> Result<()> {
-        let Some(env) = self.optimistic.env.clone() else {
-            return Ok(());
-        };
         let candidates: Vec<usize> = (first_new..self.commands.len())
             .filter(|ix| self.is_speculative_candidate(&self.commands[*ix]))
             .collect();
-        if candidates.is_empty() || !env.enabled() {
+        if candidates.is_empty() {
             return Ok(());
         }
-        let blocked = self
-            .optimistic
-            .window
-            .as_ref()
-            .is_some_and(|w| w.checkpoint.is_some())
-            || self.local_activity_data.outstanding_la_count() > 0
-            || !self.message_outbox.is_empty()
-            || self.workflow_is_finished()
-            || self
-                .commands
-                .iter()
-                .enumerate()
-                .any(|(ix, c)| !candidates.contains(&ix) && !self.command_is_deferrable(c));
-        if blocked {
-            return Ok(());
-        }
-        let (Some(received), Some(wft_timeout)) = (
-            self.optimistic.wft_received_at,
-            self.get_started_info()
-                .and_then(|i| i.workflow_task_timeout),
-        ) else {
-            return Ok(());
+        let eligible = match self.optimistic.env.clone() {
+            Some(env) if env.enabled() => self
+                .optimistic_eligibility(&env, &candidates)
+                .map(|e| (env, e)),
+            _ => Err(FallbackReason::Capability),
         };
-        let now = env.now();
-        let window_deadline = self
-            .optimistic
-            .window
-            .as_ref()
-            .map(|w| w.deadline)
-            .unwrap_or_else(|| received + wft_timeout.mul_f32(WINDOW_DEADLINE_FRACTION));
-        if window_deadline <= now + wft_timeout.mul_f32(MIN_REMAINING_WINDOW_FRACTION) {
-            return Ok(());
-        }
-
-        let mut deadline = window_deadline;
-        let mut num_activities = 0;
-        for ix in &candidates {
-            let Some(ProtoCmdAttrs::ScheduleActivityTaskCommandAttributes(attrs)) =
-                self.commands[*ix].command.attributes.as_ref()
-            else {
-                continue;
-            };
-            let same_queue = attrs
-                .task_queue
-                .as_ref()
-                .is_none_or(|tq| tq.name.is_empty() || tq.name == self.worker_config.task_queue);
-            if !same_queue {
+        let (env, eligible) = match eligible {
+            Ok(e) => e,
+            Err(reason) => {
+                debug!(run_id = %self.run_id, ?reason, "Sending speculative commands normally");
+                self.metrics
+                    .with_new_attrs([fallback_reason(reason.as_str())])
+                    .optimistic_start_fallback(candidates.len() as u64);
                 return Ok(());
             }
-            if let Some(d) = activity_handoff_deadline(
-                now,
-                attrs.start_to_close_timeout,
-                attrs.schedule_to_close_timeout,
-            ) {
-                if d <= now {
-                    return Ok(());
-                }
-                deadline = deadline.min(d);
-            }
-            num_activities += 1;
-        }
-        if num_activities > 0 && !env.reserve_activity_slots(num_activities) {
-            return Ok(());
-        }
+        };
 
         let generation = match &self.optimistic.window {
             Some(w) => w.generation,
@@ -590,13 +599,16 @@ impl WorkflowMachines {
                     generation,
                     checkpoint: None,
                     queued: Default::default(),
-                    deadline: window_deadline,
+                    deadline: eligible.window_deadline,
+                    wft_deadline: eligible.window_deadline,
+                    opened_at: eligible.now,
                 });
                 generation
             }
         };
-        let start_offset: prost_types::Duration = now
-            .saturating_duration_since(received)
+        let start_offset: prost_types::Duration = eligible
+            .now
+            .saturating_duration_since(eligible.received)
             .try_into()
             .unwrap_or_default();
         for ix in candidates {
@@ -619,6 +631,11 @@ impl WorkflowMachines {
                     attrs.request_eager_execution = false;
                     let attrs = attrs.clone();
                     let task = self.optimistic_activity_task(&attrs);
+                    self.metrics
+                        .with_new_attrs([metric_activity_type(
+                            attrs.activity_type.unwrap_or_default().name,
+                        )])
+                        .optimistic_activity_started();
                     env.start_activity(OptimisticActivityStart {
                         run_id: self.run_id.clone(),
                         generation,
@@ -632,6 +649,7 @@ impl WorkflowMachines {
                         .start_to_fire_timeout
                         .and_then(|d| Duration::try_from(d).ok())
                         .unwrap_or_default();
+                    self.metrics.optimistic_timer_started();
                     env.start_timer(&self.run_id, generation, seq, duration);
                 }
                 _ => {}
@@ -643,9 +661,97 @@ impl WorkflowMachines {
             .window
             .as_mut()
             .expect("Window was just opened");
-        w.deadline = deadline;
-        env.set_deadline(&self.run_id, generation, deadline);
+        w.deadline = eligible.deadline;
+        env.set_deadline(&self.run_id, generation, eligible.deadline);
         Ok(())
+    }
+
+    /// Decides whether this activation's speculative commands can all start optimistically,
+    /// reserving the activity slots they need if so.
+    fn optimistic_eligibility(
+        &self,
+        env: &Arc<dyn OptimisticEnv>,
+        candidates: &[usize],
+    ) -> Result<Eligible, FallbackReason> {
+        if self
+            .optimistic
+            .window
+            .as_ref()
+            .is_some_and(|w| w.checkpoint.is_some())
+        {
+            return Err(FallbackReason::WindowClosing);
+        }
+        if self.local_activity_data.outstanding_la_count() > 0 {
+            return Err(FallbackReason::LocalActivities);
+        }
+        if !self.message_outbox.is_empty()
+            || self.workflow_is_finished()
+            || self
+                .commands
+                .iter()
+                .enumerate()
+                .any(|(ix, c)| !candidates.contains(&ix) && !self.command_is_deferrable(c))
+        {
+            return Err(FallbackReason::NonDeferrableBatch);
+        }
+        let (Some(received), Some(wft_timeout)) = (
+            self.optimistic.wft_received_at,
+            self.get_started_info()
+                .and_then(|i| i.workflow_task_timeout),
+        ) else {
+            return Err(FallbackReason::WindowTime);
+        };
+        let now = env.now();
+        let window_deadline = self
+            .optimistic
+            .window
+            .as_ref()
+            .map(|w| w.wft_deadline)
+            .unwrap_or_else(|| received + wft_timeout.mul_f32(WINDOW_DEADLINE_FRACTION));
+        if window_deadline <= now + wft_timeout.mul_f32(MIN_REMAINING_WINDOW_FRACTION) {
+            return Err(FallbackReason::WindowTime);
+        }
+        let mut deadline = self
+            .optimistic
+            .window
+            .as_ref()
+            .map(|w| w.deadline)
+            .unwrap_or(window_deadline);
+        let mut num_activities = 0;
+        for ix in candidates {
+            let Some(ProtoCmdAttrs::ScheduleActivityTaskCommandAttributes(attrs)) =
+                self.commands[*ix].command.attributes.as_ref()
+            else {
+                continue;
+            };
+            let same_queue = attrs
+                .task_queue
+                .as_ref()
+                .is_none_or(|tq| tq.name.is_empty() || tq.name == self.worker_config.task_queue);
+            if !same_queue {
+                return Err(FallbackReason::TaskQueue);
+            }
+            if let Some(d) = activity_handoff_deadline(
+                now,
+                attrs.start_to_close_timeout,
+                attrs.schedule_to_close_timeout,
+            ) {
+                if d <= now {
+                    return Err(FallbackReason::WindowTime);
+                }
+                deadline = deadline.min(d);
+            }
+            num_activities += 1;
+        }
+        if num_activities > 0 {
+            env.reserve_activity_slots(num_activities)?;
+        }
+        Ok(Eligible {
+            now,
+            received,
+            window_deadline,
+            deadline,
+        })
     }
 
     fn optimistic_activity_task(
@@ -695,10 +801,20 @@ impl WorkflowMachines {
         if w.checkpoint.is_some() {
             return;
         }
-        if !self.message_outbox.is_empty()
-            || self.commands.iter().any(|c| !self.command_is_deferrable(c))
-        {
-            self.request_optimistic_checkpoint(CheckpointReason::NonDeferrableCommand);
+        let mut non_deferrable = self
+            .commands
+            .iter()
+            .filter(|c| !self.command_is_deferrable(c))
+            .peekable();
+        if non_deferrable.peek().is_some() || !self.message_outbox.is_empty() {
+            let reason = if self.workflow_is_finished() {
+                CheckpointReason::WorkflowCompletion
+            } else if non_deferrable.any(|c| self.is_speculative_candidate(c)) {
+                CheckpointReason::IneligibleCommand
+            } else {
+                CheckpointReason::NonDeferrableCommand
+            };
+            self.request_optimistic_checkpoint(reason);
         } else if self.local_activity_data.outstanding_la_count() > 0 {
             self.request_optimistic_checkpoint(CheckpointReason::LocalActivity);
         } else if self.optimistic.block_exited
@@ -719,7 +835,12 @@ impl WorkflowMachines {
         }
         match result.kind {
             OptimisticResultKind::Deadline => {
-                self.request_optimistic_checkpoint(CheckpointReason::Deadline);
+                let reason = if w.deadline < w.wft_deadline {
+                    CheckpointReason::ActivityTimeout
+                } else {
+                    CheckpointReason::Deadline
+                };
+                self.request_optimistic_checkpoint(reason);
                 return Ok(true);
             }
             OptimisticResultKind::TimerFired { seq } => {
@@ -856,6 +977,11 @@ impl WorkflowMachines {
             .unwrap_or_default();
         let after_commands = self.commands.len();
         let first_event_id = self.predicted_event_id(after_commands);
+        let observed_outcome = match &q.outcome {
+            OptimisticOutcome::Activity(OptimisticActivityOutcome::Completed(_)) => "completed",
+            OptimisticOutcome::Activity(OptimisticActivityOutcome::Canceled(_)) => "canceled",
+            OptimisticOutcome::TimerFired => "fired",
+        };
         let (command, event_count, outcome) = match q.outcome {
             OptimisticOutcome::Activity(o) => {
                 let Machines::ActivityMachine(m) = self.machine(q.machine) else {
@@ -933,6 +1059,17 @@ impl WorkflowMachines {
             event_count,
             command: Some(command),
         });
+        match self.machine(q.machine) {
+            Machines::ActivityMachine(m) => {
+                self.metrics
+                    .with_new_attrs([
+                        metric_activity_type(m.attrs().activity_type.clone()),
+                        optimistic_outcome(observed_outcome),
+                    ])
+                    .optimistic_activity_observed();
+            }
+            _ => self.metrics.optimistic_timer_fired(),
+        }
         if let Some(token) = q.token {
             env.activity_outcome_observed(&token);
         }
@@ -957,6 +1094,9 @@ impl WorkflowMachines {
                 }
             }
             Machines::TimerMachine(m) => {
+                if !m.resolved_optimistically() {
+                    self.metrics.optimistic_timer_cancelled(1);
+                }
                 env.cancel_timer(&self.run_id, w.generation, m.seq());
             }
             _ => {}
@@ -1005,6 +1145,17 @@ impl ActivityTimeouts {
             heartbeat: proto(heartbeat),
         }
     }
+}
+
+/// What [WorkflowMachines::optimistic_eligibility] found when an activation's speculative commands
+/// can start optimistically.
+struct Eligible {
+    now: Instant,
+    received: Instant,
+    /// 80% of the workflow task timeout
+    window_deadline: Instant,
+    /// The window's checkpoint deadline once these commands start
+    deadline: Instant,
 }
 
 /// The time by which an activity started now must be handed off, so the server can enforce its
