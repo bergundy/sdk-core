@@ -63,6 +63,8 @@ struct Entry {
     activity_type: String,
     /// When the activity started, which the server backdates its scheduled and started times to.
     started_at: Instant,
+    /// Set if the checkpoint that handed the activity off also closed the workflow.
+    workflow_closed: bool,
     fate: watch::Sender<Fate>,
     heartbeat_details: Option<Vec<temporalio_common::protos::temporal::api::common::v1::Payload>>,
 }
@@ -140,6 +142,7 @@ impl OptimisticActivities {
                 activity_id: task.activity_id.clone(),
                 activity_type: task.activity_type.clone().unwrap_or_default().name,
                 started_at: Instant::now(),
+                workflow_closed: false,
                 fate: watch::Sender::new(Fate::InWindow),
                 heartbeat_details: None,
             },
@@ -230,16 +233,23 @@ impl OptimisticActivities {
     }
 
     /// Hands still running activities of a checkpointed window over to the server, matching them
-    /// to the tasks the server returned by activity id. Activities the server didn't return (ex:
-    /// because the workflow closed) are discarded.
-    pub(crate) fn handoff(&self, run_id: &str, tasks: &[PollActivityTaskQueueResponse]) -> Handoff {
+    /// to the tasks the server returned by activity id. Activities the server didn't return are
+    /// discarded. If the checkpoint closed the workflow, nothing can observe the handed off
+    /// activities anymore, so their local executions are cancelled too, while their tokens stay
+    /// mapped so the outcome and anything the server sends about them still find their way.
+    pub(crate) fn handoff(
+        &self,
+        run_id: &str,
+        tasks: &[PollActivityTaskQueueResponse],
+        workflow_closed: bool,
+    ) -> Handoff {
         let mut to_cancel = vec![];
         let mut handoff = Handoff::default();
         let mut handed_off_tokens = vec![];
         {
             let mut inner = self.inner.lock();
             let mut real_tokens = vec![];
-            for (token, e) in inner.by_token.iter() {
+            for (token, e) in inner.by_token.iter_mut() {
                 if e.run_id != run_id || *e.fate.borrow() != Fate::InWindow {
                     continue;
                 }
@@ -248,10 +258,14 @@ impl OptimisticActivities {
                         let real: TaskToken = task.task_token.clone().into();
                         debug!(activity_id = %e.activity_id, synthetic = %token, real = %real,
                                "Handed off optimistic activity");
+                        e.workflow_closed = workflow_closed;
                         e.fate.send_replace(Fate::HandedOff(real.clone()));
                         real_tokens.push((real, token.clone()));
                         handoff.handed_off.push(e.activity_type.clone());
                         handed_off_tokens.push((token.clone(), e.started_at));
+                        if workflow_closed {
+                            to_cancel.push(token.clone());
+                        }
                     }
                     None => {
                         debug!(activity_id = %e.activity_id,
@@ -314,13 +328,27 @@ impl OptimisticActivities {
         }
     }
 
-    /// True if the activity's window was discarded, ex: before lang even received the task.
-    pub(crate) fn is_dropped(&self, token: &TaskToken) -> bool {
+    /// True if the local execution of an optimistic activity must be cancelled as soon as lang
+    /// receives it, because its window was discarded or its workflow closed before then.
+    pub(crate) fn cancel_on_dispatch(&self, token: &TaskToken) -> bool {
         self.inner
             .lock()
             .by_token
             .get(token)
-            .is_some_and(|e| *e.fate.borrow() == Fate::Dropped)
+            .is_some_and(|e| match *e.fate.borrow() {
+                Fate::Dropped => true,
+                Fate::HandedOff(_) => e.workflow_closed,
+                Fate::InWindow | Fate::Observed => false,
+            })
+    }
+
+    /// True if the activity was handed off by a checkpoint that also closed its workflow.
+    pub(crate) fn handed_off_with_closed_workflow(&self, token: &TaskToken) -> bool {
+        self.inner
+            .lock()
+            .by_token
+            .get(token)
+            .is_some_and(|e| e.workflow_closed)
     }
 
     /// Returns the token lang knows a handed off activity by.
