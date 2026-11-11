@@ -209,7 +209,6 @@ impl Workflows {
                 activity_tasks_handle.clone(),
                 registry.clone(),
                 local_tx.clone(),
-                basics.worker_config.optimistic_start_payload_budget,
             )));
         }
         let shutdown_tok = basics.shutdown_token.clone();

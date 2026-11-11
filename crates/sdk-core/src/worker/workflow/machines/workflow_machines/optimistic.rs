@@ -24,7 +24,6 @@ use crate::{
         },
     },
 };
-use prost::Message;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
@@ -91,7 +90,6 @@ struct Window {
     checkpoint: Option<CheckpointReason>,
     /// Outcomes that arrived but haven't been delivered yet, in arrival order.
     queued: VecDeque<QueuedOutcome>,
-    payload_bytes: usize,
     deadline: Instant,
 }
 
@@ -113,7 +111,6 @@ pub(crate) enum CheckpointReason {
     NonDeferrableCommand,
     LocalActivity,
     Deadline,
-    PayloadBudget,
     UnobservedOutcome,
     QueryResponse,
     Eviction,
@@ -553,12 +550,6 @@ impl WorkflowMachines {
         }
 
         let mut deadline = window_deadline;
-        let mut payload_bytes = self
-            .optimistic
-            .window
-            .as_ref()
-            .map(|w| w.payload_bytes)
-            .unwrap_or_default();
         let mut num_activities = 0;
         for ix in &candidates {
             let Some(ProtoCmdAttrs::ScheduleActivityTaskCommandAttributes(attrs)) =
@@ -583,11 +574,7 @@ impl WorkflowMachines {
                 }
                 deadline = deadline.min(d);
             }
-            payload_bytes += attrs.input.as_ref().map(|p| p.encoded_len()).unwrap_or(0);
             num_activities += 1;
-        }
-        if payload_bytes > env.payload_budget() {
-            return Ok(());
         }
         if num_activities > 0 && !env.reserve_activity_slots(num_activities) {
             return Ok(());
@@ -603,7 +590,6 @@ impl WorkflowMachines {
                     generation,
                     checkpoint: None,
                     queued: Default::default(),
-                    payload_bytes: 0,
                     deadline: window_deadline,
                 });
                 generation
@@ -657,7 +643,6 @@ impl WorkflowMachines {
             .window
             .as_mut()
             .expect("Window was just opened");
-        w.payload_bytes = payload_bytes;
         w.deadline = deadline;
         env.set_deadline(&self.run_id, generation, deadline);
         Ok(())
@@ -830,7 +815,6 @@ impl WorkflowMachines {
             return Ok(());
         };
         loop {
-            let budget = env.payload_budget();
             let Some(w) = self.optimistic.window.as_mut() else {
                 return Ok(());
             };
@@ -852,23 +836,6 @@ impl WorkflowMachines {
             if !still_observable {
                 continue;
             }
-            let size = match &q.outcome {
-                OptimisticOutcome::Activity(OptimisticActivityOutcome::Completed(p)) => {
-                    p.as_ref().map(|p| p.encoded_len()).unwrap_or_default()
-                }
-                OptimisticOutcome::Activity(OptimisticActivityOutcome::Canceled(a)) => a
-                    .details
-                    .as_ref()
-                    .map(|p| p.encoded_len())
-                    .unwrap_or_default(),
-                OptimisticOutcome::TimerFired => 0,
-            };
-            let w = self.optimistic.window.as_mut().expect("Checked above");
-            if w.payload_bytes + size > budget {
-                self.request_optimistic_checkpoint(CheckpointReason::PayloadBudget);
-                return Ok(());
-            }
-            w.payload_bytes += size;
             return self.deliver_optimistic_outcome(&env, q);
         }
     }

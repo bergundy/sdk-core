@@ -1224,6 +1224,26 @@ fn update_slots(slots_info: &mut Option<WorkerSlotsInfo>, client_heartbeat_data:
     }
 }
 
+/// The commands of each page a completion with these commands is sent in.
+#[cfg(test)]
+pub(crate) fn wft_completion_command_pages(commands: Vec<Command>) -> Vec<Vec<Command>> {
+    let request = RespondWorkflowTaskCompletedRequest {
+        commands,
+        ..Default::default()
+    };
+    match paginate_wft_completion(request, MAX_WFT_COMPLETION_PAGE_SIZE) {
+        WftCompletionPages::Single(r) => vec![r.commands],
+        WftCompletionPages::Paginated {
+            intermediate_pages,
+            final_page,
+        } => intermediate_pages
+            .into_iter()
+            .chain([final_page])
+            .map(|p| p.commands)
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

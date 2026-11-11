@@ -34,8 +34,6 @@ pub(crate) trait OptimisticEnv: Send + Sync {
     /// Whether commands may be started optimistically at all, ex: the namespace has the
     /// capability and this worker runs activities.
     fn enabled(&self) -> bool;
-    /// Maximum total size of payloads a window may accumulate in its log.
-    fn payload_budget(&self) -> usize;
     fn now(&self) -> Instant;
     /// Reserves `n` activity slots for optimistic starts. Reserves nothing and returns false if
     /// they are not all available.
@@ -104,7 +102,6 @@ pub(crate) struct OptimisticRuntime {
     activities: Option<ActivitiesFromWFTsHandle>,
     registry: Arc<OptimisticActivities>,
     local_tx: UnboundedSender<LocalInput>,
-    payload_budget: usize,
     reserved: Mutex<Vec<TrackedOwnedMeteredSemPermit<ActivitySlotKind>>>,
     timers: Mutex<HashMap<(String, u32), AbortHandle>>,
     deadlines: Mutex<HashMap<String, AbortHandle>>,
@@ -116,14 +113,12 @@ impl OptimisticRuntime {
         activities: Option<ActivitiesFromWFTsHandle>,
         registry: Arc<OptimisticActivities>,
         local_tx: UnboundedSender<LocalInput>,
-        payload_budget: usize,
     ) -> Self {
         Self {
             capabilities,
             activities,
             registry,
             local_tx,
-            payload_budget,
             reserved: Default::default(),
             timers: Default::default(),
             deadlines: Default::default(),
@@ -175,10 +170,6 @@ impl OptimisticRuntime {
 impl OptimisticEnv for OptimisticRuntime {
     fn enabled(&self) -> bool {
         self.capabilities.optimistic_start()
-    }
-
-    fn payload_budget(&self) -> usize {
-        self.payload_budget
     }
 
     fn now(&self) -> Instant {
